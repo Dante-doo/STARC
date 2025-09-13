@@ -1,205 +1,189 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, json, gzip, time
-from datetime import datetime
+# Run inference on the test split and save:
+# - CSV with per-sample probabilities/predictions
+# - JSON with confusion/metrics
+# Uses best checkpoint and best_threshold.json if available.
+
+import os, json, argparse
 from pathlib import Path
-import argparse
 import numpy as np
 import pandas as pd
+from PIL import Image
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
 from torchvision import models, transforms
-from torchvision.io import read_image, ImageReadMode
+
+from code.config import (
+    ROOT, LABELS_DIR, MODELS_DIR,
+    RESULTS_METRICS_DIR, RESULTS_PREDS_DIR,
+    TRAIN_MODALITY, TRAIN_ARCH, TRAIN_PRETRAINED, TRAIN_FREEZE_BACKBONE,
+    TRAIN_CHANNELS_LAST, TRAIN_THRESHOLD,
+    EVAL_BATCH_SIZE, EVAL_WORKERS, EVAL_PREFETCH,
+)
 
 # ---------- utils ----------
-def map_path_for_modality(raw_path: str, modality: str) -> str:
-    p = raw_path.replace("\\", "/")
-    if modality == "raw":
-        return p
-    if "/patches/raw/" not in p:
+def map_path_for_modality(raw_rel_path: str, modality: str) -> str:
+    """Map RAW → {raw,hough,combined} paths with our naming."""
+    p = raw_rel_path.replace("\\", "/")
+    if modality == "raw" or "/patches/raw/" not in p:
         return p
     if modality == "hough":
-        p2 = p.replace("/patches/raw/", "/patches/hough/")
-        stem, ext = os.path.splitext(p2)
-        return f"{stem}_hough{ext}"
+        q = p.replace("/patches/raw/", "/patches/hough/")
+        q = q.replace("_r.png", "_h.png").replace("_r_", "_h_")
+        return q
     if modality == "combined":
-        p2 = p.replace("/patches/raw/", "/patches/combined/")
-        stem, ext = os.path.splitext(p2)
-        return f"{stem}_combined{ext}"
-    raise ValueError("modality inválida")
+        q = p.replace("/patches/raw/", "/patches/combined/")
+        q = q.replace("_r.png", "_c.png").replace("_r_", "_c_")
+        return q
+    return p
 
-class CsvDataset(Dataset):
-    """Carrega paths do CSV e lê PNGs; retorna também o path usado para avaliação."""
-    def __init__(self, csv_path: str, repo_root: str, modality: str, grayscale: bool):
-        self.df = pd.read_csv(csv_path)
-        self.repo_root = Path(repo_root)
-        self.modality = modality
-        self.grayscale = grayscale
-
-        ops = [transforms.Resize((224, 224), antialias=True),
-               transforms.ConvertImageDtype(torch.float32)]
-        if grayscale:
-            mean, std = [0.5], [0.25]
-        else:
-            mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-        ops += [transforms.Normalize(mean=mean, std=std)]
-        self.tf = transforms.Compose(ops)
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        raw_rel = str(row["path"])
-        eval_rel = map_path_for_modality(raw_rel, self.modality)
-        full = str(self.repo_root / eval_rel)
-        mode = ImageReadMode.GRAY if self.grayscale else ImageReadMode.RGB
-        img_u8 = read_image(full, mode=mode)  # uint8 [C,H,W]
-        x = self.tf(img_u8)
-        y = torch.tensor([float(row["label"])], dtype=torch.float32)
-        return x, y, raw_rel, eval_rel
-
-# ---------- modelos ----------
-def make_resnet18(grayscale: bool):
-    model = models.resnet18(weights=None)
+def make_resnet18(pretrained=True, grayscale=True, freeze_backbone=False):
+    """ResNet18 1-channel in, single logit out."""
+    try:
+        weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        model = models.resnet18(weights=weights)
+    except Exception:
+        model = models.resnet18(weights=None)
     if grayscale and model.conv1.in_channels == 3:
         with torch.no_grad():
             w = model.conv1.weight
             new = nn.Conv2d(1, w.shape[0], kernel_size=7, stride=2, padding=3, bias=False)
             new.weight.copy_(w.mean(dim=1, keepdim=True))
         model.conv1 = new
+    if freeze_backbone:
+        for n, p in model.named_parameters():
+            if not n.startswith("fc."):
+                p.requires_grad = False
     model.fc = nn.Linear(model.fc.in_features, 1)
     return model
 
-def build_model(arch: str, grayscale: bool):
-    arch = arch.lower()
-    if arch == "resnet18":
-        return make_resnet18(grayscale)
-    if arch == "cnn":
-        raise NotImplementedError("CNN personalizada ainda não foi implementada.")
-    raise ValueError(f"Arquitetura desconhecida: {arch}")
+def arch_dirname(arch: str) -> str:
+    return "resnet" if arch.startswith("resnet") else arch
 
-# ---------- métricas ----------
-def bin_metrics(y_true, y_prob, thr=0.5):
-    y_true = np.asarray(y_true, dtype=int)
-    y_prob = np.asarray(y_prob, dtype=float)
-    y_pred = (y_prob >= thr).astype(int)
+def metrics_from_preds(y_true: np.ndarray, y_prob: np.ndarray, thr: float) -> dict:
+    """Compute confusion and metrics at threshold thr."""
+    y_pred = (y_prob >= thr).astype(np.int32)
+    TP = int(np.sum((y_pred == 1) & (y_true == 1)))
+    TN = int(np.sum((y_pred == 0) & (y_true == 0)))
+    FP = int(np.sum((y_pred == 1) & (y_true == 0)))
+    FN = int(np.sum((y_pred == 0) & (y_true == 1)))
+    acc  = (TP + TN) / max(1, TP + TN + FP + FN)
+    prec = TP / max(1, TP + FP)
+    rec  = TP / max(1, TP + FN)
+    tnr  = TN / max(1, TN + FP)
+    f1   = (2 * prec * rec) / max(1e-9, prec + rec)
+    f2   = (5 * prec * rec) / max(1e-9, (4 * prec + rec))
+    balacc = 0.5 * (rec + tnr)
+    return {"threshold": float(thr), "acc": acc, "prec1": prec, "recall1": rec,
+            "tnr": tnr, "f1": f1, "f2": f2, "balacc": balacc,
+            "tp": TP, "fp": FP, "tn": TN, "fn": FN, "n": int(len(y_true))}
 
-    tp = int(((y_pred == 1) & (y_true == 1)).sum())
-    tn = int(((y_pred == 0) & (y_true == 0)).sum())
-    fp = int(((y_pred == 1) & (y_true == 0)).sum())
-    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+# ---------- dataset ----------
+class TestDataset(torch.utils.data.Dataset):
+    """Load grayscale PNGs; normalize to mean=0.5,std=0.25."""
+    def __init__(self, csv_path: Path, repo_root: Path, modality: str):
+        df = pd.read_csv(csv_path)
+        self.paths  = [repo_root / map_path_for_modality(p, modality) for p in df["path"].tolist()]
+        self.labels = df["label"].astype(np.float32).values
+        self.tf = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.25]),
+        ])
 
-    eps = 1e-9
-    acc = (tp + tn) / max(1, tp + tn + fp + fn)
-    prec = tp / max(1, tp + fp + eps)
-    rec = tp / max(1, tp + fn + eps)
-    f1 = 2 * prec * rec / max(1e-9, prec + rec)
-    return acc, prec, rec, f1, tp, fp, fn, tn
+    def __len__(self): return len(self.paths)
+    def __getitem__(self, idx):
+        img = Image.open(self.paths[idx]).convert("L")
+        x   = self.tf(img)
+        y   = torch.tensor([self.labels[idx]], dtype=torch.float32)
+        return x, y, str(self.paths[idx])
 
 # ---------- main ----------
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--arch", choices=["resnet18", "cnn"], default="resnet18")
-    ap.add_argument("--modality", choices=["raw", "hough", "combined"], required=True)
-    ap.add_argument("--batch-size", type=int, default=256)
-    ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--grayscale", action="store_true")
-    ap.add_argument("--threshold", type=float, default=0.5)
-    ap.add_argument("--no-save", action="store_true", help="Não salva métricas/predições em disco")
+    ap = argparse.ArgumentParser(description="Test/evaluate on test split")
+    ap.add_argument("--arch", choices=["resnet18", "cnn"], default=None)
+    ap.add_argument("--modality", choices=["raw", "hough", "combined"], default=None)
+    ap.add_argument("--ckpt", choices=["best", "last"], default="best")
     args = ap.parse_args()
 
-    repo_root = Path(__file__).resolve().parents[1]  # .../satelite
-    csv_path = repo_root / "labels" / "test.csv"
-
-    # checkpoints padrão: models/<arch_or_resnet>/<modality>/last.pt
-    arch_dir = "resnet" if args.arch == "resnet18" else args.arch
-    ckpt_dir = repo_root / "models" / arch_dir / args.modality
-    ckpt_path = ckpt_dir / "last.pt"
-
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Checkpoint não encontrado: {ckpt_path}")
+    arch     = args.arch or TRAIN_ARCH
+    modality = args.modality or TRAIN_MODALITY
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] device={device} | arch={args.arch} | modality={args.modality} | grayscale={args.grayscale}")
-    print(f"[INFO] CSV: {csv_path}")
-    print(f"[INFO] Checkpoint: {ckpt_path}")
 
-    if args.arch == "cnn":
-        print("CNN personalizada ainda não foi implementada. Use --arch resnet18.")
-        return
+    test_csv = LABELS_DIR / "test.csv"
+    if not test_csv.exists():
+        raise FileNotFoundError("labels/test.csv not found. Run split first.")
 
-    ds = CsvDataset(str(csv_path), repo_root=str(repo_root),
-                    modality=args.modality, grayscale=args.grayscale)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
-                        num_workers=args.workers, pin_memory=torch.cuda.is_available())
+    ds = TestDataset(test_csv, ROOT, modality)
+    loader = torch.utils.data.DataLoader(
+        ds, batch_size=EVAL_BATCH_SIZE, shuffle=False,
+        num_workers=EVAL_WORKERS, pin_memory=torch.cuda.is_available(),
+        prefetch_factor=EVAL_PREFETCH if EVAL_WORKERS > 0 else None,
+        persistent_workers=(EVAL_WORKERS > 0),
+    )
 
-    model = build_model(args.arch, grayscale=args.grayscale).to(device)
-    ckpt = torch.load(ckpt_path, map_location=device)
-    state = ckpt["model_state"] if (isinstance(ckpt, dict) and "model_state" in ckpt) else ckpt
-    model.load_state_dict(state)
+    # model + weights
+    if arch == "cnn":
+        raise SystemExit("CNN not implemented yet. Use --arch resnet18.")
+    model = make_resnet18(pretrained=TRAIN_PRETRAINED, grayscale=True, freeze_backbone=TRAIN_FREEZE_BACKBONE)
+    if torch.cuda.is_available() and TRAIN_CHANNELS_LAST:
+        model = model.to(memory_format=torch.channels_last)
+    model = model.to(device)
 
+    ckpt_dir = MODELS_DIR / arch_dirname(arch) / modality
+    ckpt_path = ckpt_dir / (f"{args.ckpt}.pt")
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    state = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(state["model"], strict=True)
     model.eval()
-    y_true, y_prob, rows = [], [], []
-    t0 = time.time()
+
+    # choose threshold: prefer saved best_threshold.json
+    best_thr_file = ckpt_dir / "best_threshold.json"
+    if best_thr_file.exists():
+        best_thr = float(json.loads(best_thr_file.read_text())["threshold"])
+    else:
+        best_thr = float(TRAIN_THRESHOLD)
+
+    # inference
+    probs, labels, relpaths = [], [], []
     with torch.no_grad():
-        for xb, yb, raw_rel, eval_rel in loader:
+        for xb, yb, pth in loader:
             xb = xb.to(device, non_blocking=True)
-            yb = yb.to(device, non_blocking=True)
-            prob = torch.sigmoid(model(xb).squeeze(1))
-            y_true.extend(yb.squeeze(1).cpu().numpy().tolist())
-            y_prob.extend(prob.cpu().numpy().tolist())
-            # guarda paths e rótulos para reuso posterior
-            for rraw, rev, yy, pp in zip(raw_rel, eval_rel, yb.squeeze(1).cpu().tolist(), prob.cpu().tolist()):
-                rows.append((rraw, rev, float(yy), float(pp)))
+            if TRAIN_CHANNELS_LAST and xb.is_cuda:
+                xb = xb.to(memory_format=torch.channels_last)
+            logits = model(xb)
+            pr = torch.sigmoid(logits).view(-1).detach().cpu().numpy()
+            lb = yb.view(-1).detach().cpu().numpy()
+            probs.append(pr); labels.append(lb); relpaths += pth
 
-    acc, prec, rec, f1, tp, fp, fn, tn = bin_metrics(y_true, y_prob, thr=args.threshold)
-    print("\n==== RESULTADOS (TEST) ====")
-    print(f"Acc: {acc*100:.2f}% | Precision: {prec*100:.2f}% | Recall: {rec*100:.2f}% | F1: {f1*100:.2f}%")
-    print(f"Confusion Matrix: tp={tp} fp={fp} fn={fn} tn={tn}")
-    print(f"Amostras: {len(ds)} | Tempo: {time.time()-t0:.1f}s")
+    y_prob = np.concatenate(probs, axis=0)
+    y_true = np.concatenate(labels, axis=0).astype(np.int32)
+    mets   = metrics_from_preds(y_true, y_prob, best_thr)
 
-    if not args.no_save:
-        # diretórios de saída
-        metrics_dir = repo_root / "results" / "metrics" / arch_dir / args.modality
-        preds_dir   = repo_root / "results" / "predictions" / arch_dir / args.modality
-        metrics_dir.mkdir(parents=True, exist_ok=True)
-        preds_dir.mkdir(parents=True, exist_ok=True)
+    # save predictions CSV
+    out_pred_dir = RESULTS_PREDS_DIR / arch_dirname(arch) / modality
+    out_pred_dir.mkdir(parents=True, exist_ok=True)
+    pred_csv = out_pred_dir / "test_preds.csv"
+    pd.DataFrame({"path": relpaths, "label": y_true, "prob": y_prob, "pred": (y_prob >= best_thr).astype(int)}).to_csv(pred_csv, index=False)
 
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # save metrics JSON
+    out_met_dir = RESULTS_METRICS_DIR / arch_dirname(arch) / modality
+    out_met_dir.mkdir(parents=True, exist_ok=True)
+    met_json = out_met_dir / "test_metrics.json"
+    with open(met_json, "w", encoding="utf-8") as f:
+        json.dump({"arch": arch, "modality": modality, "ckpt": args.ckpt, "threshold": best_thr, "metrics": mets}, f, indent=2)
 
-        # salva métricas agregadas (json)
-        metrics = {
-            "arch": args.arch,
-            "modality": args.modality,
-            "grayscale": bool(args.grayscale),
-            "threshold": float(args.threshold),
-            "samples": int(len(ds)),
-            "acc": float(acc), "precision": float(prec), "recall": float(rec), "f1": float(f1),
-            "tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn),
-            "checkpoint": str(ckpt_path),
-            "timestamp": ts
-        }
-        metrics_path = metrics_dir / f"test_metrics_{ts}.json"
-        with open(metrics_path, "w", encoding="utf-8") as f:
-            json.dump(metrics, f, ensure_ascii=False, indent=2)
-        # cópia "latest"
-        with open(metrics_dir / "test_metrics_latest.json", "w", encoding="utf-8") as f:
-            json.dump(metrics, f, ensure_ascii=False, indent=2)
-
-        # salva predições (csv.gz)
-        preds_df = pd.DataFrame(rows, columns=["path_raw", "path_eval", "label", "prob"])
-        preds_df["pred"] = (preds_df["prob"] >= args.threshold).astype(int)
-        preds_path = preds_dir / f"test_preds_{ts}.csv.gz"
-        preds_df.to_csv(preds_path, index=False, compression="gzip")
-        preds_df.to_csv(preds_dir / "test_preds_latest.csv.gz", index=False, compression="gzip")
-
-        print(f"[OK] Métricas: {metrics_path}")
-        print(f"[OK] Predições: {preds_path}")
-        print(f"[OK] Também salvos *_latest.* para consumo rápido pelo results.py")
+    # print short summary
+    print(f"[OK] Test done | arch={arch} modality={modality} thr={best_thr:.3f}")
+    print(f"acc={mets['acc']*100:.2f}%  prec1={mets['prec1']:.4f}  recall1={mets['recall1']:.4f}  "
+          f"tnr={mets['tnr']:.4f}  balacc={mets['balacc']:.4f}")
+    print(f"TP={mets['tp']} FP={mets['fp']} TN={mets['tn']} FN={mets['fn']}")
+    print(f"preds:  {pred_csv}")
+    print(f"metrics:{met_json}")
 
 if __name__ == "__main__":
     main()

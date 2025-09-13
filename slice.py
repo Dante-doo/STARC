@@ -1,58 +1,54 @@
 #!/usr/bin/env python3
-import os
-import glob
-import cv2
+# -*- coding: utf-8 -*-
 
-def slice_full_images(
-    raw_dir="../images/full/raw",
-    mask_dir="../images/full/full_asta_masks",
-    out_raw="../images/patches/raw",
-    out_mask="../images/patches/asta_masks",
-    tile_size=224,
-    grid_size=47
-):
-    # garante diretórios base
-    os.makedirs(out_raw, exist_ok=True)
-    os.makedirs(out_mask, exist_ok=True)
+# Slice full images into a centered 47x47 grid of 224x224 patches.
+# Outputs:
+#   images/patches/raw/standart/<fullX>/<fullX_l_c_r>.png
+#   images/patches/mask/standart/<fullX>/<fullX_l_c_m>.png
 
-    for raw_path in glob.glob(os.path.join(raw_dir, "*")):
-        base = os.path.splitext(os.path.basename(raw_path))[0]
-        mask_path = os.path.join(mask_dir, f"{base}_mask.png")
-        if not os.path.isfile(mask_path):
-            print(f"Aviso: máscara não encontrada para {base}, pulando.")
+from PIL import Image
+from code.config import (
+    FULL_RAW_DIR, FULL_MASKS_DIR,
+    RAW_STD_DIR, MASK_STD_DIR,
+    SFX_R, SFX_M, PATCH_SIZE, GRID_ROWS, GRID_COLS
+)
+
+def main():
+    """Slice all full images + masks into fixed-size grayscale patches."""
+    raws = sorted(FULL_RAW_DIR.glob("full*.png"))
+    if not raws:
+        raise FileNotFoundError(f"No 'full*.png' in {FULL_RAW_DIR}")
+
+    for rp in raws:
+        fid = rp.stem  # e.g., 'full12'
+        mp = FULL_MASKS_DIR / f"{fid}_mask.png"
+        if not mp.exists():  # minimal validation
+            print(f"[slice] Missing mask for {fid}, skipping.")
             continue
 
-        # cria subpastas específicas para esta imagem
-        raw_subdir  = os.path.join(out_raw, base)
-        mask_subdir = os.path.join(out_mask, base)
-        os.makedirs(raw_subdir,  exist_ok=True)
-        os.makedirs(mask_subdir, exist_ok=True)
+        # Ensure per-full subfolders exist (raw and mask)
+        raw_sub  = (RAW_STD_DIR  / fid); raw_sub.mkdir(parents=True, exist_ok=True)
+        mask_sub = (MASK_STD_DIR / fid); mask_sub.mkdir(parents=True, exist_ok=True)
 
-        raw_img  = cv2.imread(raw_path, cv2.IMREAD_UNCHANGED)
-        mask_img = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
-        h, w     = raw_img.shape[:2]
+        # Load raw as 8-bit grayscale; binarize mask to {0,255}
+        raw = Image.open(rp).convert("L")
+        msk = Image.open(mp).convert("L").point(lambda v: 255 if v > 0 else 0, "L")
 
-        count = 0
-        for row in range(grid_size):
-            for col in range(grid_size):
-                y = row * tile_size
-                x = col * tile_size
-                if y + tile_size > h or x + tile_size > w:
-                    continue
+        # Centered grid offsets
+        W, H = raw.size
+        TW, TH = GRID_COLS * PATCH_SIZE, GRID_ROWS * PATCH_SIZE
+        offx, offy = (W - TW) // 2, (H - TH) // 2
 
-                patch_raw  = raw_img[y:y+tile_size, x:x+tile_size]
-                patch_mask = mask_img[y:y+tile_size, x:x+tile_size]
+        # Save deterministic, globally unique names
+        for l in range(GRID_ROWS):
+            y = offy + l * PATCH_SIZE
+            for c in range(GRID_COLS):
+                x = offx + c * PATCH_SIZE
+                box = (x, y, x + PATCH_SIZE, y + PATCH_SIZE)
+                raw.crop(box).save(raw_sub  / f"{fid}_{l}_{c}_{SFX_R}.png", "PNG", optimize=True)
+                msk.crop(box).save(mask_sub / f"{fid}_{l}_{c}_{SFX_M}.png", "PNG", optimize=True)
 
-                out_raw_path  = os.path.join(
-                    raw_subdir,  f"{base}_{row}_{col}.png")
-                out_mask_path = os.path.join(
-                    mask_subdir, f"{base}_{row}_{col}_mask.png")
-
-                cv2.imwrite(out_raw_path,  patch_raw)
-                cv2.imwrite(out_mask_path, patch_mask)
-                count += 1
-
-        print(f"Fatiado {base}: {count} patches gerados em '{base}/'")
+        print(f"[slice] {fid}: 47x47 patches OK")
 
 if __name__ == "__main__":
-    slice_full_images()
+    main()

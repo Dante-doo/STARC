@@ -15,21 +15,21 @@ RESULTS_VIS_DIR = RESULTS_DIR / "vis"
 
 # ============================== full images ==================================
 FULL_RAW_DIR    = FULL_DIR / "raw"
-FULL_MASKS_DIR  = FULL_DIR / "full_asta_masks"            # optional
+FULL_MASKS_DIR  = FULL_DIR / "full_asta_masks"
 FULL_HOUGH_DIR     = FULL_DIR / "hough"
 FULL_HOUGH_ACC_DIR = FULL_HOUGH_DIR / "accumulator"
 FULL_HOUGH_INV_DIR = FULL_HOUGH_DIR / "inversed"
 
 # ============================== patches & naming ==============================
-RAW_STD_DIR    = PATCHES_DIR / "raw"   / "standart"
+RAW_STD_DIR    = PATCHES_DIR / "raw"   / "standart"   # note: 'standart' per project
 RAW_AUG_DIR    = PATCHES_DIR / "raw"   / "augment"
 HOUGH_STD_DIR  = PATCHES_DIR / "hough" / "standart"
 HOUGH_AUG_DIR  = PATCHES_DIR / "hough" / "augment"
 MASK_STD_DIR   = PATCHES_DIR / "mask"  / "standart"
 
-SFX_R = "r"   # raw     (fullX_row_col_r.png)
-SFX_H = "h"   # hough   (fullX_row_col_h.png)
-SFX_M = "m"   # mask    (fullX_row_col_m.png)
+SFX_R = "r"  # raw     (fullX_row_col_r.png)
+SFX_H = "h"  # hough   (fullX_row_col_h.png)
+SFX_M = "m"  # mask    (fullX_row_col_m.png)
 
 PATCH_SIZE = 224
 GRID_ROWS  = 47
@@ -59,9 +59,9 @@ TRAIN_CSV = LABELS_DIR / "train.csv"
 VAL_CSV   = LABELS_DIR / "val.csv"
 TEST_CSV  = LABELS_DIR / "test.csv"
 
-# ============================== train/test (main) ============================
-TRAIN_ARCH            = "resnet18"     # "resnet18" | "cnn"(NI)
-TRAIN_MODALITY        = "raw"          # "raw" | "hough" | "combined"
+# ============================== train/test ===================================
+TRAIN_ARCH            = "resnet18"       # "resnet18" | "cnn"(NI)
+TRAIN_MODALITY        = "raw"            # "raw" | "hough" | "combined"
 TRAIN_EPOCHS          = 12
 TRAIN_BATCH_SIZE      = 128
 TRAIN_LR              = 1e-3
@@ -94,7 +94,7 @@ HOUGH_ACC_INPUT_GLOB  = "full*.png"
 HOUGH_ACC_NUM_THETA   = 360
 HOUGH_FULL_DOWNSCALE  = 1
 
-# Edge variants (picked by unsupervised heatmap score)
+# Preproc variants (best chosen by unsupervised score)
 HOUGH_AUTO_VARIANTS = [
     {"edge": "sobel_otsu", "open": 0, "close": 0, "clahe": True},
     {"edge": "sobel_otsu", "open": 3, "close": 0, "clahe": True},
@@ -102,56 +102,61 @@ HOUGH_AUTO_VARIANTS = [
     {"edge": "canny",      "open": 3, "close": 0, "clahe": True},
 ]
 
-# Canny sensitivity by percentiles of |grad|
-CANNY_PERC_LOW  = 90.0
-CANNY_PERC_HIGH = 99.5
-CANNY_PERC_LOW_FALLBACK  = 85.0
-CANNY_PERC_HIGH_FALLBACK = 99.0
+# Canny thresholds from |grad| percentiles (more permissive)
+CANNY_PERC_LOW           = 80.0
+CANNY_PERC_HIGH          = 99.0
+CANNY_PERC_LOW_FALLBACK  = 75.0
+CANNY_PERC_HIGH_FALLBACK = 98.0
 
 # Heatmap score S = w_peak*peakiness(topK) + w_anis*anisotropy
 HOUGH_SCORE_TOPK   = 64
 HOUGH_SCORE_W_PEAK = 0.7
 HOUGH_SCORE_W_ANIS = 0.3
 
-# Peak selection (search percentile to reach K_min..K_max)
-HPOINTS_K_MIN         = 3
-HPOINTS_K_MAX         = 12
-HPOINTS_PMIN          = 99.50
+# Peak selection (auto-percentile target)
+HPOINTS_K_MIN         = 2
+HPOINTS_K_MAX         = 20
+HPOINTS_PMIN          = 99.30
 HPOINTS_PMAX          = 99.99
-HPOINTS_BIN_STEPS     = 8
-HPOINTS_MIN_DIST_RHO  = 100
-HPOINTS_MIN_ANGLE_DEG = 3.0
-HPOINTS_MAX_PEAKS     = 32
+HPOINTS_BIN_STEPS     = 10
+HPOINTS_MIN_DIST_RHO  = 80      # rho-bin distance (not px), a bit looser
+HPOINTS_MIN_ANGLE_DEG = 2.0
+HPOINTS_MAX_PEAKS     = 48
 HPOINTS_DOT_RADIUS    = 2
 HPOINTS_BG_ALPHA      = 0.12
 
-# Refinement (fix small offsets)
-HOUGH_REFINE_PEAK_WINDOW      = 7     # accumulator window (odd)
-HOUGH_REFINE_LOCAL_DRHO_PX    = 6     # ±rho search (px)
-HOUGH_REFINE_LOCAL_DTHETA_DEG = 0.4   # ±theta search (deg)
-HOUGH_REFINE_LOCAL_STEP_THETA = 0.1   # step (deg)
+# Refinement
+HOUGH_REFINE_PEAK_WINDOW      = 7
+HOUGH_REFINE_LOCAL_DRHO_PX    = 6
+HOUGH_REFINE_LOCAL_DTHETA_DEG = 0.4
+HOUGH_REFINE_LOCAL_STEP_THETA = 0.1
 
-# Artifact handling (column/row defects)
-ARTIF_KMAD           = 6.0   # k*MAD deviation to flag col/row
-ARTIF_MIN_RUN        = 8     # min contiguous run to consider artifact
-ANGLE_VETO_DEG       = 2.0   # width around 0° or 90° to penalize
-ANGLE_VETO_WEIGHT    = 0.2   # multiplier for penalized angle bins
+# Artifact handling (col/row defects)
+ARTIF_KMAD        = 6.0
+ARTIF_MIN_RUN     = 8
+ANGLE_VETO_DEG    = 2.0
+ANGLE_VETO_WEIGHT = 0.2
 
-# Line validation / pruning
+# Line validation / pruning (looser)
 HOUGH_INV_LINE_THICKNESS = 2
-HOUGH_LINE_MINLEN_FULL   = 2000
+HOUGH_LINE_MINLEN_FULL   = 1500
 HOUGH_ONOFF_OFFSET_PX    = 3
-HOUGH_KEEP_TOPK          = 6
-HOUGH_KEEP_SCORE_PCT     = 98.0
+HOUGH_KEEP_TOPK          = 8
+HOUGH_KEEP_SCORE_PCT     = 90.0     # keep more candidates
 
-# Continuity/width gates
-CONTINUITY_THR_PCT  = 90.0   # percentile of |grad| to count "on"
-CONTINUITY_MIN_FRAC = 0.55   # min fraction along the line above thr
-WIDTH_REL_THR       = 0.5    # level to measure width in normal profile
-WIDTH_MIN_PX        = 1.0
-WIDTH_MAX_PX        = 8.0
-WIDTH_PROFILE_HALF  = 8      # half-window (px) for normal profiles
-WIDTH_SAMPLES_ALONG = 30     # number of normal profiles along line
+# Continuity/width gates (looser)
+CONTINUITY_THR_PCT  = 85.0
+CONTINUITY_MIN_FRAC = 0.40
+WIDTH_REL_THR       = 0.5
+WIDTH_MIN_PX        = 0.5
+WIDTH_MAX_PX        = 12.0
+WIDTH_PROFILE_HALF  = 8
+WIDTH_SAMPLES_ALONG = 30
+
+# Emergency fallback (if still 0 lines after pruning)
+HOUGH_EMERGENCY_ENABLE = True
+HOUGH_EMERG_MINLEN     = 1200
+HOUGH_EMERG_TOPK       = 2   # pick top-N by on-off score
 
 # ROI outputs
 ROI_IMG_DIR            = LABELS_DIR / "roi"
