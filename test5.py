@@ -8,22 +8,6 @@ import numpy as np
 import cv2
 from skimage.transform import hough_line, hough_line_peaks
 
-# ---- structure tensor (compat entre versões do scikit-image) ----
-from skimage.feature import structure_tensor
-try:
-    # skimage >= 0.22
-    from skimage.feature import structure_tensor_eigenvalues as _st_eigs
-except ImportError:
-    # skimage <= 0.21
-    from skimage.feature import structure_tensor_eigvals as _st_eigs
-
-def _st_eigs_compat(Axx, Axy, Ayy):
-    """Chama eigenvalues de forma compatível com todas as versões."""
-    try:
-        return _st_eigs(Axx, Axy, Ayy)         # skimage <= 0.21
-    except TypeError:
-        return _st_eigs((Axx, Axy, Ayy))       # skimage >= 0.22
-
 # =================== Paths ===================
 RAW_DIR    = Path("raw")
 ACC_DIR    = Path("hough/accumulator_points")
@@ -442,6 +426,7 @@ def auto_tune(metrics, scale):
     ov["RESP_PERC_WEAK"]   = 99.4
     ov["RESP_PERC_STRONG"] = 98.0
     ov["LINE_THICK_STRONG"]= 4
+    ov["COH_THR"] = 0.18
 
     if star_heavy:
         ov.update({
@@ -449,12 +434,13 @@ def auto_tune(metrics, scale):
             "SMALL_STAR_MAX_A": 25,
             "BIG_STAR_Q": 99.87,
             "BIG_STAR_MIN_A": 600,
-            "BIG_STAR_GROW_PX": max(25, int(round(35*scale))),
+            "BIG_STAR_GROW_PX": max(35, int(round(45*scale))),   # <— maior crescimento do halo
             "GATE_K": 3,
             "RESP_PERC_WEAK": 99.6,
             "SUPPORT_MIN_RATIO": 0.06,
             "SUPPORT_MIN_ABS":  max(400, int(round(1400*scale))),
-            "SEG_MIN_LEN":      max(40, int(round(70*scale)))
+            "SEG_MIN_LEN":      max(40, int(round(70*scale))),
+            "COH_THR": 0.26
         })
 
     if strong_like:
@@ -466,7 +452,8 @@ def auto_tune(metrics, scale):
             "SUPPORT_MIN_RATIO": 0.035,
             "SUPPORT_MIN_ABS":   max(200, int(round(800*scale))),
             "SEG_MIN_LEN":       max(30, int(round(60*scale))),
-            "SEG_DILATE_ALONG":  6
+            "SEG_DILATE_ALONG":  6,
+            "COH_THR": max(0.20, ov["COH_THR"])
         })
     elif weak_like and not star_heavy:
         ov.update({
@@ -476,7 +463,8 @@ def auto_tune(metrics, scale):
             "SUPPORT_MIN_ABS":max(200, int(round(700*scale))),
             "SUPPORT_MIN_RATIO": 0.035,
             "SEG_MIN_LEN":    max(25, int(round(45*scale))),
-            "SEG_DILATE_ALONG": 6
+            "SEG_DILATE_ALONG": 6,
+            "COH_THR": 0.20
         })
 
     ov["NO_TRAIL_GUARD"] = (m["peak_ratio"] < 5.0 and star_heavy)
@@ -551,37 +539,77 @@ def merge_colinear_segments(segs, ang_tol_deg=1.2, gap_max=40):
         out.append((P[0],P[1]))
     return out
 
-# ---------- Coherence gate (structure tensor) ----------
-def choose_coh_threshold(metrics):
-    # adaptativo, baseado nas métricas da cena
-    thr = 0.24
-    if metrics.get("peak_ratio", 0) >= 12.0:
-        thr = 0.18                 # trilha forte → tolerar mais
-    if (metrics.get("small_star_density", 0) > 2.0e-4) or (metrics.get("big_star_frac", 0) > 0.015):
-        thr = max(thr, 0.30)       # céu muito estrelado/halos → ser mais estrito
-    return float(np.clip(thr, 0.15, 0.45))
+# --------- Coherence gate (structure tensor simples, sem skimage eig) ---------
+def coherence_gate(u8, win=9, thr=0.20):
+    """Retorna (mask 0/255, visualização, orientação_deg[0..180))."""
+    f = u8.astype(np.float32)
+    gx = cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3)
+    k = win | 1
+    Axx = cv2.GaussianBlur(gx*gx, (k,k), 0)
+    Axy = cv2.GaussianBlur(gx*gy, (k,k), 0)
+    Ayy = cv2.GaussianBlur(gy*gy, (k,k), 0)
+    # eigenvalues do tensor 2x2
+    trace = Axx + Ayy
+    det   = Axx*Ayy - Axy*Axy
+    tmp = (Axx - Ayy)**2 + 4.0*(Axy**2)
+    tmp = np.sqrt(np.maximum(tmp, 0))
+    l1 = 0.5*(trace + tmp)
+    l2 = 0.5*(trace - tmp)
+    coh = (l1 - l2) / (l1 + l2 + 1e-6)
+    ori = 0.5*np.degrees(np.arctan2(2*Axy, (Axx - Ayy)))
+    ori = (ori % 180.0).astype(np.float32)
+    m = (coh >= float(thr)).astype(np.uint8)*255
+    # visualização
+    vis = (np.clip(coh,0,1)*255).astype(np.uint8)
+    vis = cv2.applyColorMap(vis, cv2.COLORMAP_TURBO)
+    return m, vis, ori
 
-def coherence_gate(u8, win=9, thr=0.25):
-    """Calcula coerência local e retorna máscara binária (0/255) e visualização."""
-    f = (u8.astype(np.float32) / 255.0)
-    sigma = max(0.5, win/6.0)
-    Axx, Axy, Ayy = structure_tensor(f, sigma=sigma, mode='reflect')
-    l1, l2 = _st_eigs_compat(Axx, Axy, Ayy)
-    eps = 1e-9
-    coh = (l1 - l2) / (l1 + l2 + eps)
-    coh = np.clip(coh, 0, 1)
+# --------- Auxiliares para pós-Hough orientado ---------
+def ang_diff_deg(a, b):
+    d = abs(a - b) % 180.0
+    return min(d, 180.0 - d)
 
-    mask = (coh >= float(thr)).astype(np.uint8) * 255
-    # pequeno pós-processamento para tirar sal fino
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k, 1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, 1)
+def dominant_angle(thetas_rad, weights=None):
+    if len(thetas_rad) == 0:
+        return None
+    th = np.degrees(np.asarray(thetas_rad)) % 180.0
+    if weights is None:
+        weights = np.ones_like(th)
+    bins = np.arange(0, 180+1.0, 1.0)
+    hist, _ = np.histogram(th, bins=bins, weights=weights)
+    idx = np.argmax(hist)
+    th_star_deg = 0.5 * (bins[idx] + bins[idx+1])
+    return np.radians(th_star_deg)
 
-    # mapa p/ debug (0..255)
-    vis = (255.0 * coh).astype(np.uint8)
-    # orientação (não usada aqui, mas pode ser útil no futuro)
-    ori = (0.5*np.degrees(np.arctan2(2*Axy, Axx - Ayy))) % 180.0
-    return mask, vis, ori
+def refine_rho_histogram(edges_u8, theta, est_rho=None, search=50, bin_size=1.0):
+    ys, xs = np.where(edges_u8 > 0)
+    if xs.size < 50:
+        return est_rho
+    rho_vals = xs * math.cos(theta) + ys * math.sin(theta)
+    if est_rho is not None:
+        sel = np.abs(rho_vals - est_rho) <= float(search)
+        rho_vals = rho_vals[sel]
+        if rho_vals.size < 30:
+            return est_rho
+    rmin, rmax = float(rho_vals.min()), float(rho_vals.max())
+    nbins = max(10, int(math.ceil((rmax - rmin) / bin_size)))
+    hist, edges = np.histogram(rho_vals, bins=nbins, range=(rmin, rmax))
+    if hist.max() <= 0:
+        return est_rho
+    k = int(np.argmax(hist))
+    rho_peak = 0.5 * (edges[k] + edges[k+1])
+    return rho_peak
+
+def oriented_close_one(img_u8, theta_deg, length=61):
+    ksz = int(length) | 1
+    ker = np.zeros((ksz, ksz), np.uint8)
+    c = ksz // 2
+    cv2.line(ker, (0, c), (ksz-1, c), 255, 1)
+    M = cv2.getRotationMatrix2D((c, c), float(theta_deg), 1.0)
+    ker = cv2.warpAffine(ker, M, (ksz, ksz), flags=cv2.INTER_NEAREST)
+    ker = (ker > 0).astype(np.uint8)
+    return cv2.morphologyEx(img_u8, cv2.MORPH_CLOSE, ker, iterations=1)
 
 # =================== Main ===================
 for img_path in sorted(files, key=num_key):
@@ -656,6 +684,7 @@ for img_path in sorted(files, key=num_key):
     SEG_DILATE_ALONG       = ov.get("SEG_DILATE_ALONG", SEG_DILATE_ALONG)
     NO_TRAIL_GUARD         = ov.get("NO_TRAIL_GUARD", False)
     CLOSE_K_S              = max(1, scale_len(ov.get("CLOSE_K", CLOSE_K), scale))
+    COH_THR                = float(ov.get("COH_THR", 0.18))
 
     # Se não forte, limpe mais sal
     if not NO_TRAIL_GUARD and RESP_PERC_STRONG >= 98.0:
@@ -687,7 +716,7 @@ for img_path in sorted(files, key=num_key):
     edges_s_pos = auto_canny(xs, CANNY_SIGMA)
     edges_s_neg = auto_canny(255 - xs, CANNY_SIGMA)
 
-    # ---------- União + gating (conservador: AND) ----------
+    # ---------- União + gating ----------
     mask_union = cv2.bitwise_or(mask_w, mask_s)
     mask_union[big_mask>0] = 0
     gate = cv2.dilate(mask_union, cv2.getStructuringElement(cv2.MORPH_RECT,(GATE_K_S,GATE_K_S)), 1)
@@ -695,17 +724,12 @@ for img_path in sorted(files, key=num_key):
     edges_all_raw[big_mask>0] = 0
     edges_gated   = cv2.bitwise_and(edges_all_raw, gate)
 
-    # ---------- NOVO: coherence gate (structure tensor) ----------
-    coh_thr = choose_coh_threshold(metrics)
-    coh_mask, coh_vis, _ = coherence_gate(base, win=9, thr=coh_thr)
-    coh_mask[big_mask>0] = 0
-    # aplicar a coerência nas bordas antes das morfologias
-    edges_gated = cv2.bitwise_and(edges_gated, coh_mask)
-    cv2.imwrite(str(DBG_DIR / f"{name}_coherence_vis.png"),  coh_vis)
-    cv2.imwrite(str(DBG_DIR / f"{name}_coherence_mask.png"), coh_mask)
+    # --- Coherence gate (derruba ruído não-linear e halos) ---
+    coh_mask, coh_vis, ori_deg = coherence_gate(base, win=9, thr=COH_THR)
+    cv2.imwrite(str(DBG_DIR / f"{name}_coherence.png"), coh_vis)
+    edges_union = cv2.bitwise_and(edges_gated, coh_mask)
 
     # ---------- Morfologia + fechamento direcional ----------
-    edges_union = edges_gated.copy()
     if OPEN_K_S>1:
         edges_union = cv2.morphologyEx(edges_union, cv2.MORPH_OPEN,  cv2.getStructuringElement(cv2.MORPH_RECT,(OPEN_K_S,OPEN_K_S)), 1)
     if CLOSE_K_S>1:
@@ -715,10 +739,9 @@ for img_path in sorted(files, key=num_key):
     if np.count_nonzero(edges_union) < 4000:
         edges_union = directional_close(edges_union, length=DIR_CLOSE_LEN_S+10, step=5)
 
-    # Strong-only (também passa pelo coherence gate)
+    # Strong-only (para Hough auxiliar)
     edges_strong = cv2.bitwise_or(mask_s, cv2.bitwise_or(edges_s_pos, edges_s_neg))
     edges_strong[big_mask>0] = 0
-    edges_strong = cv2.bitwise_and(edges_strong, coh_mask)
     if OPEN_K_S>1:
         edges_strong = cv2.morphologyEx(edges_strong, cv2.MORPH_OPEN,  cv2.getStructuringElement(cv2.MORPH_RECT,(OPEN_K_S,OPEN_K_S)), 1)
     if CLOSE_K_S>1:
@@ -745,15 +768,46 @@ for img_path in sorted(files, key=num_key):
         band=SUPPORT_BAND_S, min_ratio=SUPPORT_MIN_RATIO, min_abs=SUPPORT_MIN_ABS_S
     )
 
-    # ---------- Poda por direção adaptativa ----------
+    # ---------- Poda por direção adaptativa (1ª passada) ----------
     rho_tmp, th_tmp, hits = prune_by_theta_bins(
         rho_peaks, theta_peaks, edges_union, band=SUPPORT_BAND_S,
         bin_w_deg=1.5, keep_bins=3
     )
     if len(hits)>=3 and max(hits) > 2.0*sorted(hits)[-2]:
-        keep_bins = 1
+        keep_bins0 = 1
     else:
-        keep_bins = 1 if NO_TRAIL_GUARD else (2 if len(rho_peaks)>10 else 1)
+        keep_bins0 = 2 if len(rho_peaks)>10 else 1
+    rho_peaks, theta_peaks, _ = prune_by_theta_bins(
+        rho_peaks, theta_peaks, edges_union, band=SUPPORT_BAND_S,
+        bin_w_deg=1.5, keep_bins=keep_bins0
+    )
+
+    # ---------- Pós-processo orientado: θ* + refino de ρ + fechamento só em θ* ----------
+    theta_star = dominant_angle(theta_peaks) if len(theta_peaks)>0 else None
+
+    edges_for_fit = edges_union.copy()
+    # Gate por orientação local (±12°) se disponível
+    if theta_star is not None and ori_deg is not None:
+        delta = np.abs(np.vectorize(ang_diff_deg)(ori_deg, np.degrees(theta_star)))
+        ori_gate = (delta <= 12.0).astype(np.uint8) * 255
+        edges_for_fit = cv2.bitwise_and(edges_for_fit, ori_gate)
+
+    # Fechamento forte apenas no θ*
+    if theta_star is not None:
+        edges_for_fit = oriented_close_one(edges_for_fit, np.degrees(theta_star), length=max(41, DIR_CLOSE_LEN_S+20))
+
+    # Refino de ρ por histograma no ângulo vencedor
+    if len(theta_peaks)>0:
+        rho_refined = []
+        for rho, th in zip(rho_peaks, theta_peaks):
+            th_use = theta_star if theta_star is not None else th
+            rho_new = refine_rho_histogram(edges_for_fit, th_use, est_rho=rho, search=40, bin_size=1.0)
+            rho_refined.append((rho_new, th_use))
+        rho_peaks = np.array([p[0] for p in rho_refined], dtype=float)
+        theta_peaks = np.array([p[1] for p in rho_refined], dtype=float)
+
+    # Se segundo bin ainda for relevante, mantenha 2
+    keep_bins = 2 if (len(hits) >= 2 and sorted(hits)[-2] >= 0.7*max(hits)) else 1
     rho_peaks, theta_peaks, _ = prune_by_theta_bins(
         rho_peaks, theta_peaks, edges_union, band=SUPPORT_BAND_S,
         bin_w_deg=1.5, keep_bins=keep_bins
@@ -767,21 +821,22 @@ for img_path in sorted(files, key=num_key):
     cv2.imwrite(str(ACC_DIR / f"{name}_acc_points.png"), acc_img_pts)
     acc_preview = render_acc_preview(angU, rhoU, rho_peaks, theta_peaks, max_w=TILE_W, min_px=3)
 
-    # ---------- Extrair segmentos ----------
+    # ---------- Extrair segmentos (usar edges_for_fit) ----------
     segments_scaled = []
     for rho, theta in zip(rho_peaks, theta_peaks):
         seg = extract_segment_from_edges(
-            edges_union, rho, theta,
+            edges_for_fit, rho, theta,
             band=SEG_BAND_S, min_len=SEG_MIN_LEN_S,
             dilate_along=SEG_DILATE_ALONG, endpoint_r=SEG_ENDPOINT_RADIUS
         )
         if seg is None:
             seg = extract_segment_from_edges(
-                edges_union, rho, theta,
-                band=SEG_BAND_S, min_len=SEG_MIN_LEN_S,
+                edges_for_fit, rho, theta,
+                band=SEG_BAND_S, min_len=max(30, int(0.85*SEG_MIN_LEN_S)),
                 dilate_along=SEG_DILATE_ALONG+2, endpoint_r=SEG_ENDPOINT_RADIUS
             )
         if seg is None:
+            # fallback curto (reta longa)
             diag = int(np.hypot(H, W))
             a, b = math.cos(theta), math.sin(theta)
             x0, y0 = a*rho, b*rho
@@ -822,9 +877,6 @@ for img_path in sorted(files, key=num_key):
         edges_all_raw2 = edges_all_raw.copy()
         edges_all_raw2[big_mask>0] = 0
         edges_gated2 = cv2.bitwise_and(edges_all_raw2, gate2)
-        # aplica coherence gate também
-        edges_gated2 = cv2.bitwise_and(edges_gated2, coh_mask)
-
         edges_union2 = edges_gated2
         if OPEN_K_S>1:
             edges_union2 = cv2.morphologyEx(edges_union2, cv2.MORPH_OPEN,  cv2.getStructuringElement(cv2.MORPH_RECT,(OPEN_K_S,OPEN_K_S)), 1)
@@ -838,13 +890,13 @@ for img_path in sorted(files, key=num_key):
             band=SUPPORT_BAND_S, min_ratio=SUPPORT_MIN_RATIO, min_abs=SUPPORT_MIN_ABS_S
         )
         if len(rho_peaks2)==0:
+            # último recurso: afinar ângulos fortes
             LINE_ANGLES_STRONG_F = list(range(0,180,2))
             resp_s2b = line_bank_response(xs, LINE_KLEN_STRONG_S, LINE_THICK_STRONG, LINE_ANGLES_STRONG_F)
             thr_s2b  = np.percentile(resp_s2b, max(96.8, RESP_PERC_STRONG-0.5))
             mask_s2b = (resp_s2b >= thr_s2b).astype(np.uint8)*255
             edges_strong2 = cv2.bitwise_or(mask_s2b, cv2.bitwise_or(edges_s_pos, edges_s_neg))
             edges_strong2[big_mask>0] = 0
-            edges_strong2 = cv2.bitwise_and(edges_strong2, coh_mask)
             edges_strong2 = directional_close(edges_strong2, length=DIR_CLOSE_LEN_STRONG_S+10, step=8)
             hS2, angS2, rhoS2, accS2, thS2, rS2 = run_hough(edges_strong2)
             rho_peaks2, theta_peaks2 = filter_lines_by_support(
@@ -852,6 +904,7 @@ for img_path in sorted(files, key=num_key):
                 band=SUPPORT_BAND_S, min_ratio=SUPPORT_MIN_RATIO*0.9, min_abs=int(0.9*SUPPORT_MIN_ABS_S)
             )
 
+        # segmentos do fallback
         segments_scaled2 = []
         for rho, theta in zip(rho_peaks2, theta_peaks2):
             seg = extract_segment_from_edges(
