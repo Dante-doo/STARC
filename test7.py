@@ -51,20 +51,20 @@ BIG_STAR_GROW_PX   = 25
 # Banco de linhas
 LINE_KLEN, LINE_THICK = 31, 1
 LINE_ANGLES           = list(range(0,180,5))
-LINE_THICK_STRONG   = 4
+LINE_THICK_STRONG   = 5
 LINE_ANGLES_STRONG  = list(range(0,180,3))
-RESP_PERC_WEAK      = 99.4
-RESP_PERC_STRONG    = 98.0
+RESP_PERC_WEAK      = 99.1
+RESP_PERC_STRONG    = 97.6
 
 # Bordas & morfologia
-CANNY_SIGMA = 0.33
+CANNY_SIGMA = 0.4
 OPEN_K, CLOSE_K, GATE_K = 3, 5, 5
 
 # Fechamento direcional
 USE_DIR_CLOSE   = True
-DIR_CLOSE_LEN   = 45
-DIR_CLOSE_STEP  = 10
-DIR_CLOSE_LEN_STRONG = 61
+DIR_CLOSE_LEN   = 55
+DIR_CLOSE_STEP  = 7
+DIR_CLOSE_LEN_STRONG = 71
 
 # Hough & desenho
 NUM_PEAKS, MIN_DIST, MIN_ANG = 400, 20, 8
@@ -72,14 +72,14 @@ DOT_RADIUS, DRAW_THICK = 3, 3
 
 # Filtro de suporte geométrico
 SUPPORT_BAND      = 4
-SUPPORT_MIN_RATIO = 0.04
-SUPPORT_MIN_ABS   = 900
+SUPPORT_MIN_RATIO = 0.03
+SUPPORT_MIN_ABS   = 650
 MAX_LINES_TO_CHECK= 120
 
 # Segmento finito
-SEG_BAND            = 3
-SEG_MIN_LEN         = 50
-SEG_DILATE_ALONG    = 5
+SEG_BAND            = 5
+SEG_MIN_LEN         = 45
+SEG_DILATE_ALONG    = 8
 SEG_ENDPOINT_RADIUS = 5
 
 # Preview
@@ -340,7 +340,7 @@ def extract_segment_from_edges(edges, rho, theta, band, min_len, dilate_along=5,
 
 # ===== NOVO: extração com coerência para limitar o comprimento (sem alterar processos) =====
 def extract_segment_from_edges_coh(edges, coh_mask, ori_deg, rho, theta,
-                                   band, min_len, ang_tol_deg=12.0, max_gap_px=8):
+                                   band, min_len, ang_tol_deg=18.0, max_gap_px=8):
     """
     Usa edges ∧ coh_mask ∧ |ori-theta|<=ang_tol dentro de uma faixa da reta (rho,theta)
     e escolhe o maior trecho contínuo em coordenada projetada (sem erosão/fechamento).
@@ -721,7 +721,8 @@ for img_path in sorted(files, key=num_key):
     SEG_DILATE_ALONG       = ov.get("SEG_DILATE_ALONG", SEG_DILATE_ALONG)
     NO_TRAIL_GUARD         = ov.get("NO_TRAIL_GUARD", False)
     CLOSE_K_S              = max(1, scale_len(ov.get("CLOSE_K", CLOSE_K), scale))
-    COH_THR                = float(ov.get("COH_THR", 0.18))
+    COH_THR                = float(ov.get("COH_THR", 0.14))
+    COH_THR = min(COH_THR, 0.14)   # garante que não ficará acima de 0.14
 
     # ---------- Big stars / halos ----------
     big_mask = detect_big_stars(base, BIG_STAR_Q, BIG_STAR_MIN_A_S, BIG_STAR_GROW_PX_S)
@@ -757,7 +758,7 @@ for img_path in sorted(files, key=num_key):
     edges_gated   = cv2.bitwise_and(edges_all_raw, gate)
 
     # --- Coerência (para limitar comprimento; sem alterar o resto) ---
-    coh_mask, coh_vis, ori_deg = coherence_gate(base, win=9, thr=COH_THR)
+    coh_mask, coh_vis, ori_deg = coherence_gate(base, win=11, thr=COH_THR)
     cv2.imwrite(str(DBG_DIR / f"{name}_coherence.png"), coh_vis)
 
     # ---------- Morfologia + fechamento direcional (original) ----------
@@ -852,7 +853,7 @@ for img_path in sorted(files, key=num_key):
     segments_orig = [(up(p1), up(p2)) for (p1,p2) in segments_scaled]
 
     # Merge + rejeições
-    segments_orig = merge_colinear_segments(segments_orig, ang_tol_deg=1.2, gap_max=40)
+    segments_orig = merge_colinear_segments(segments_orig, ang_tol_deg=1.2, gap_max=60)
     segments_orig = reject_1px_vertical_segments(segments_orig, img0, tol=2, min_run=0.10)
 
     # ---------- Desenho ----------
