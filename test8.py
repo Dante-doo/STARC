@@ -28,7 +28,8 @@ def num_key(p: Path):
     return int(m.group(1)) if m else 0
 
 # =================== Hyperparams (base) ===================
-PROC_MAX_SIDE = 2048
+# Downscale para acelerar (resto reescala automaticamente)
+PROC_MAX_SIDE = 2048  # lado máx. no processamento
 
 # Normalização
 PERC_LOW, PERC_HIGH    = 0.5, 99.9
@@ -40,54 +41,65 @@ MEDIAN_K, BG_K         = 3, 31
 
 # Small-star removal
 SMALL_STAR_Q       = 99.0
-SMALL_STAR_MAX_A   = 30
+SMALL_STAR_MAX_A   = 30      # px^2 (reescalado)
 SMALL_STAR_DILATE  = 1
 
-# Big-star exclusion (halos)
+# Big-star exclusion (halos) → EXCLUIR do processamento
 BIG_STAR_Q         = 99.85
-BIG_STAR_MIN_A     = 400
-BIG_STAR_GROW_PX   = 25
+BIG_STAR_MIN_A     = 400     # px^2 (reescalado)
+BIG_STAR_GROW_PX   = 25      # px (reescalado)
 
 # Banco de linhas
 LINE_KLEN, LINE_THICK = 31, 1
 LINE_ANGLES           = list(range(0,180,5))
-LINE_THICK_STRONG   = 5
+# Strong extras
+LINE_THICK_STRONG   = 4
 LINE_ANGLES_STRONG  = list(range(0,180,3))
-RESP_PERC_WEAK      = 99.1
-RESP_PERC_STRONG    = 97.6
+RESP_PERC_WEAK      = 99.4
+RESP_PERC_STRONG    = 98.0
 
 # Bordas & morfologia
-CANNY_SIGMA = 0.4
+CANNY_SIGMA = 0.33
 OPEN_K, CLOSE_K, GATE_K = 3, 5, 5
 
 # Fechamento direcional
 USE_DIR_CLOSE   = True
-DIR_CLOSE_LEN   = 55
-DIR_CLOSE_STEP  = 7
-DIR_CLOSE_LEN_STRONG = 71
+DIR_CLOSE_LEN   = 45
+DIR_CLOSE_STEP  = 10
+DIR_CLOSE_LEN_STRONG = 61
 
 # Hough & desenho
 NUM_PEAKS, MIN_DIST, MIN_ANG = 400, 20, 8
-DOT_RADIUS, DRAW_THICK = 3, 3
+DOT_RADIUS, DRAW_THICK = 3, 3   # linhas brancas 255
 
-# Filtro de suporte geométrico
+# Filtro de suporte geométrico (pós-Hough)
 SUPPORT_BAND      = 4
-SUPPORT_MIN_RATIO = 0.03
-SUPPORT_MIN_ABS   = 650
+SUPPORT_MIN_RATIO = 0.04
+SUPPORT_MIN_ABS   = 900
 MAX_LINES_TO_CHECK= 120
 
-# Segmento finito
-SEG_BAND            = 5
-SEG_MIN_LEN         = 45
-SEG_DILATE_ALONG    = 8
+# Segmento finito (não reta infinita)
+SEG_BAND            = 3
+SEG_MIN_LEN         = 50
+SEG_DILATE_ALONG    = 5
 SEG_ENDPOINT_RADIUS = 5
 
-# Preview
+# --- Refinos locais e perfil 1-D (NOVO) ---
+ANGLE_SWEEP_DEG   = 2.4   # varredura em torno do theta do Hough
+ANGLE_STEP_DEG    = 0.2
+ORI_TOL_DEG       = 14.0  # tolerância de orientação local
+PROFILE_BAND_MULT = 1.0   # multiplica o SEG_BAND_S
+PROFILE_WIN       = 33    # suavização 1-D ao longo da linha
+PROFILE_MIN_DENS  = 0.18  # fração mínima por seção transversal
+PROFILE_MAX_GAP   = 16   # hiatos tolerados (px)
+MIN_MEAN_COH      = 0.22  # coerência média mínima
+
+# Preview layout
 TILE_W, CONTENT_H, SEP, SEP_COLOR, TITLE_H = 1200, 900, 10, (45,45,45), 56
 
-# Artefatos verticais
+# Artefatos verticais (colunas 1px brancas/pretas sem nuance)
 VERT_TOL        = 2
-VERT_MIN_RUN_R  = 0.07
+VERT_MIN_RUN_R  = 0.07   # fração da altura
 VERT_MAX_WIDTH  = 1
 
 # =================== Utils ===================
@@ -150,19 +162,27 @@ def detect_big_stars(u8, q, min_a, grow):
     return mask
 
 def detect_vertical_artifacts_strict(u8, tol=VERT_TOL, min_run_r=VERT_MIN_RUN_R, max_width=VERT_MAX_WIDTH):
+    """Detecta segmentos verticais (1 px) totalmente brancos ou pretos (sem nuance)."""
     H, W = u8.shape
     min_run = max(16, int(min_run_r * H))
+
     white = (u8 >= (255 - tol)).astype(np.uint8)
     black = (u8 <= tol).astype(np.uint8)
+
     def width1(b):
         left = np.zeros_like(b);  left[:,1:]  = b[:,:-1]
         right= np.zeros_like(b);  right[:,:-1]= b[:,1:]
         return (b & (~left) & (~right)).astype(np.uint8)
-    w1 = width1(white); b1 = width1(black)
+
+    w1 = width1(white)
+    b1 = width1(black)
+
     vker = cv2.getStructuringElement(cv2.MORPH_RECT,(1, min_run))
     w_long = cv2.morphologyEx(w1*255, cv2.MORPH_OPEN, vker)
     b_long = cv2.morphologyEx(b1*255, cv2.MORPH_OPEN, vker)
+
     mask = cv2.bitwise_or(w_long, b_long)
+
     if max_width > 1:
         hker = cv2.getStructuringElement(cv2.MORPH_RECT,(max_width+1,1))
         too_wide = cv2.morphologyEx((mask>0).astype(np.uint8)*255, cv2.MORPH_OPEN, hker)
@@ -301,21 +321,27 @@ def extract_segment_from_edges(edges, rho, theta, band, min_len, dilate_along=5,
     x0, y0 = a*rho, b*rho
     p1 = (int(x0 + diag*(-b)), int(y0 + diag*(a)))
     p2 = (int(x0 - diag*(-b)), int(y0 - diag*(a)))
+
     band_mask = np.zeros_like(edges, np.uint8)
     cv2.line(band_mask, p1, p2, 255, 2*band+1, cv2.LINE_8)
+
     ys, xs = np.where(band_mask>0)
     if xs.size == 0: 
         return None
     y0r, y1r = max(0, ys.min()-2), min(H, ys.max()+3)
     x0r, x1r = max(0, xs.min()-2), min(W, xs.max()+3)
+
     band_roi  = band_mask[y0r:y1r, x0r:x1r]
     edges_roi = edges[y0r:y1r, x0r:x1r]
     hits = cv2.bitwise_and(band_roi, edges_roi)
+
     if dilate_along>0:
         hits = cv2.dilate(hits, cv2.getStructuringElement(cv2.MORPH_RECT,(3,3)), 1)
+
     n, lab, stats, _ = cv2.connectedComponentsWithStats((hits>0).astype(np.uint8), connectivity=8)
     if n <= 1:
         return None
+
     vx, vy = -math.sin(theta), math.cos(theta)
     best = None
     for i in range(1, n):
@@ -328,97 +354,16 @@ def extract_segment_from_edges(edges, rho, theta, band, min_len, dilate_along=5,
         span = t.max() - t.min()
         if best is None or span > best[0]:
             best = (span, t.min(), t.max(), xs_i, ys_i)
+
     if best is None or best[0] < min_len:
         return None
+
     _, tmin, tmax, xs_i, ys_i = best
     t = xs_i*vx + ys_i*vy
     p_a_idx = np.argmin(np.abs(t - tmin))
     p_b_idx = np.argmin(np.abs(t - tmax))
     pA = (int(xs_i[p_a_idx]), int(ys_i[p_a_idx]))
     pB = (int(xs_i[p_b_idx]), int(ys_i[p_b_idx]))
-    return pA, pB
-
-# ===== NOVO: extração com coerência para limitar o comprimento (sem alterar processos) =====
-def extract_segment_from_edges_coh(edges, coh_mask, ori_deg, rho, theta,
-                                   band, min_len, ang_tol_deg=18.0, max_gap_px=8):
-    """
-    Usa edges ∧ coh_mask ∧ |ori-theta|<=ang_tol dentro de uma faixa da reta (rho,theta)
-    e escolhe o maior trecho contínuo em coordenada projetada (sem erosão/fechamento).
-    """
-    H, W = edges.shape
-    theta_deg = (np.degrees(theta) % 180.0)
-
-    # faixa da reta
-    diag = int(np.hypot(H, W))
-    a, b = math.cos(theta), math.sin(theta)
-    x0, y0 = a*rho, b*rho
-    p1 = (int(x0 + diag*(-b)), int(y0 + diag*(a)))
-    p2 = (int(x0 - diag*(-b)), int(y0 - diag*(a)))
-    band_mask = np.zeros_like(edges, np.uint8)
-    cv2.line(band_mask, p1, p2, 255, 2*band+1, cv2.LINE_8)
-
-    # ROI compacto
-    ys, xs = np.where(band_mask>0)
-    if xs.size == 0:
-        return None
-    y0r, y1r = max(0, ys.min()-2), min(H, ys.max()+3)
-    x0r, x1r = max(0, xs.min()-2), min(W, xs.max()+3)
-
-    band_roi = band_mask[y0r:y1r, x0r:x1r]
-    edges_roi = edges[y0r:y1r, x0r:x1r]
-    coh_roi   = coh_mask[y0r:y1r, x0r:x1r]
-    ori_roi   = ori_deg[y0r:y1r, x0r:x1r]
-
-    # gate angular pela coerência
-    delta = np.abs((ori_roi - theta_deg + 90.0) % 180.0 - 90.0)  # diferença mínima em [0,90]
-    ang_gate = (delta <= float(ang_tol_deg)).astype(np.uint8) * 255
-
-    support = cv2.bitwise_and(edges_roi, band_roi)
-    support = cv2.bitwise_and(support, coh_roi)
-    support = cv2.bitwise_and(support, ang_gate)
-
-    ys_i, xs_i = np.where(support>0)
-    if xs_i.size == 0:
-        return None
-    xs_i = xs_i + x0r; ys_i = ys_i + y0r
-
-    # projeção 1D ao longo da reta
-    vx, vy = -math.sin(theta), math.cos(theta)
-    t = xs_i*vx + ys_i*vy
-    # discretiza para controlar gaps
-    t_idx = np.unique(np.round(t).astype(int))
-    if t_idx.size < 2:
-        return None
-
-    # varre maior sequência permitindo lacunas <= max_gap_px
-    start = t_idx[0]
-    prev  = t_idx[0]
-    best_span = -1
-    best_pair = (start, start)
-    for ti in t_idx[1:]:
-        if (ti - prev) <= int(max_gap_px):
-            prev = ti
-        else:
-            span = prev - start
-            if span > best_span:
-                best_span = span
-                best_pair = (start, prev)
-            start = prev = ti
-    # fechar última sequência
-    span = prev - start
-    if span > best_span:
-        best_span = span
-        best_pair = (start, prev)
-
-    if best_span < int(min_len):
-        return None
-
-    # volta para pontos reais próximos às abscissas escolhidas
-    tmin, tmax = best_pair
-    i_a = np.argmin(np.abs(t - tmin))
-    i_b = np.argmin(np.abs(t - tmax))
-    pA = (int(xs_i[i_a]), int(ys_i[i_a]))
-    pB = (int(xs_i[i_b]), int(ys_i[i_b]))
     return pA, pB
 
 # ============ Escalonadores ============
@@ -434,6 +379,7 @@ def scale_area(val, scale, minv=1):
 def measure_scene(img_u8):
     H, W = img_u8.shape
     area = float(H*W)
+
     th = np.percentile(img_u8, 99.0)
     bin_ = cv2.threshold(img_u8, th, 255, cv2.THRESH_BINARY)[1]
     bin_ = cv2.morphologyEx(bin_, cv2.MORPH_OPEN,
@@ -441,13 +387,16 @@ def measure_scene(img_u8):
     n, lab, stats, _ = cv2.connectedComponentsWithStats(bin_, 8)
     small = sum(1 for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] <= 25)
     small_star_density = small / area
+
     thb = np.percentile(img_u8, 99.8)
     binb = cv2.threshold(img_u8, thb, 255, cv2.THRESH_BINARY)[1]
     n2, lab2, stats2, _ = cv2.connectedComponentsWithStats(binb, 8)
     big_area = sum(int(stats2[i, cv2.CC_STAT_AREA]) for i in range(1, n2)
                    if stats2[i, cv2.CC_STAT_AREA] >= 300)
     big_star_frac = big_area / area
-    rough = flatten_bg(cv2.medianBlur(img_u8, 3), 31)
+
+    rough = cv2.medianBlur(img_u8, 3)
+    rough = flatten_bg(rough, 31)
     ed = auto_canny(rough, 0.33)
     ed = cv2.morphologyEx(ed, cv2.MORPH_CLOSE,
                           cv2.getStructuringElement(cv2.MORPH_RECT,(3,3)), 1)
@@ -458,6 +407,7 @@ def measure_scene(img_u8):
         vmax = float(h.max())
         med  = float(np.median(h[h>0])) if np.count_nonzero(h) else 1.0
         peak_ratio = vmax / max(1.0, med)
+
     return dict(small_star_density=small_star_density,
                 big_star_frac=big_star_frac,
                 peak_ratio=peak_ratio)
@@ -465,9 +415,11 @@ def measure_scene(img_u8):
 def auto_tune(metrics, scale):
     m = metrics
     ov = {}
+
     star_heavy   = (m["small_star_density"] > 2.0e-4) or (m["big_star_frac"] > 0.015)
     strong_like  = (m["peak_ratio"] >= 12.0)
     weak_like    = (6.0 <= m["peak_ratio"] < 12.0)
+
     ov["GATE_K"] = 5
     ov["SUPPORT_BAND"] = max(3, int(round(4*scale)))
     ov["SUPPORT_MIN_RATIO"] = 0.04
@@ -480,6 +432,7 @@ def auto_tune(metrics, scale):
     ov["RESP_PERC_STRONG"] = 98.0
     ov["LINE_THICK_STRONG"]= 4
     ov["COH_THR"] = 0.18
+
     if star_heavy:
         ov.update({
             "SMALL_STAR_Q": 98.7,
@@ -494,6 +447,7 @@ def auto_tune(metrics, scale):
             "SEG_MIN_LEN":      max(40, int(round(70*scale))),
             "COH_THR": 0.26
         })
+
     if strong_like:
         ov.update({
             "RESP_PERC_STRONG": 97.5,
@@ -517,6 +471,7 @@ def auto_tune(metrics, scale):
             "SEG_DILATE_ALONG": 6,
             "COH_THR": 0.20
         })
+
     ov["NO_TRAIL_GUARD"] = (m["peak_ratio"] < 5.0 and star_heavy)
     return ov
 
@@ -537,6 +492,7 @@ def prune_by_theta_bins(rhos, thetas, edges, band=3, bin_w_deg=1.5, keep_bins=2)
         cv2.line(m, p1, p2, 255, 2*band+1, cv2.LINE_8)
         hits.append(cv2.countNonZero(cv2.bitwise_and(m, edges)))
     hits = np.array(hits)
+
     bin_sum = {}
     deg_bins = np.digitize(deg, bins) - 1
     for i, b in enumerate(deg_bins):
@@ -588,7 +544,7 @@ def merge_colinear_segments(segs, ang_tol_deg=1.2, gap_max=40):
         out.append((P[0],P[1]))
     return out
 
-# --------- Coherence gate ----------
+# --------- Coherence gate (agora retorna coh_map também) ---------
 def coherence_gate(u8, win=9, thr=0.20):
     f = u8.astype(np.float32)
     gx = cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3)
@@ -597,19 +553,171 @@ def coherence_gate(u8, win=9, thr=0.20):
     Axx = cv2.GaussianBlur(gx*gx, (k,k), 0)
     Axy = cv2.GaussianBlur(gx*gy, (k,k), 0)
     Ayy = cv2.GaussianBlur(gy*gy, (k,k), 0)
-    trace = Axx + Ayy
-    det   = Axx*Ayy - Axy*Axy
     tmp = (Axx - Ayy)**2 + 4.0*(Axy**2)
     tmp = np.sqrt(np.maximum(tmp, 0))
-    l1 = 0.5*(trace + tmp)
-    l2 = 0.5*(trace - tmp)
+    l1 = 0.5*((Axx + Ayy) + tmp)
+    l2 = 0.5*((Axx + Ayy) - tmp)
     coh = (l1 - l2) / (l1 + l2 + 1e-6)
-    ori = 0.5*np.degrees(np.arctan2(2*Axy, (Axx - Ayy)))
-    ori = (ori % 180.0).astype(np.float32)
-    m = (np.clip(coh,0,1) >= float(thr)).astype(np.uint8)*255
+    ori = 0.5*np.degrees(np.arctan2(2*Axy, (Axx - Ayy))) % 180.0
+    m = (coh >= float(thr)).astype(np.uint8)*255
     vis = (np.clip(coh,0,1)*255).astype(np.uint8)
     vis = cv2.applyColorMap(vis, cv2.COLORMAP_TURBO)
-    return m, vis, ori
+    return m, vis, ori.astype(np.float32), coh.astype(np.float32)
+
+# --------- Auxiliares NOVAS para o refino e o perfil ---------
+def norm01(x):
+    x = x.astype(np.float32)
+    mn, mx = float(x.min()), float(x.max())
+    if mx <= mn: 
+        return np.zeros_like(x, np.float32)
+    return (x - mn) / (mx - mn)
+
+def build_weight_map(edges_u8, coh_map, resp_map):
+    m = (edges_u8 > 0).astype(np.float32)
+    c = np.clip(coh_map, 0, 1).astype(np.float32)
+    r = norm01(resp_map)
+    w = m * (0.2 + 0.4*c + 0.4*r)
+    return w
+
+def weighted_rho_hist(xs, ys, weights, theta, est_rho=None, search=50, bin_size=1.0):
+    rho_vals = xs*np.cos(theta) + ys*np.sin(theta)
+    w = weights
+    if est_rho is not None:
+        sel = np.abs(rho_vals - est_rho) <= float(search)
+        rho_vals = rho_vals[sel]
+        w = w[sel]
+        if rho_vals.size < 30:
+            return est_rho, None
+    if rho_vals.size < 20:
+        return est_rho, None
+    rmin, rmax = float(rho_vals.min()), float(rho_vals.max())
+    nbins = max(50, int(np.ceil((rmax - rmin) / bin_size)))
+    hist, edges = np.histogram(rho_vals, bins=nbins, range=(rmin, rmax), weights=w)
+    k = int(np.argmax(hist))
+    rho_peak = 0.5 * (edges[k] + edges[k+1])
+    return rho_peak, hist.max()
+
+def refine_theta_rho_local(edges_u8, coh_map, resp_map, theta_hint, ori_deg,
+                           angle_sweep=np.radians(ANGLE_SWEEP_DEG),
+                           angle_step=np.radians(ANGLE_STEP_DEG),
+                           ori_tol_deg=ORI_TOL_DEG):
+    ys, xs = np.where(edges_u8 > 0)
+    if xs.size < 50:
+        return None, None
+    # gate por orientação local (opcional)
+    if ori_deg is not None:
+        ori_loc = ori_deg[ys, xs]
+        d = np.abs((ori_loc - np.degrees(theta_hint) + 90.0) % 180.0 - 90.0)
+        keep = d <= ori_tol_deg
+        if keep.sum() >= 30:
+            xs, ys = xs[keep], ys[keep]
+    w_all = build_weight_map(edges_u8, coh_map, resp_map)
+    weights = w_all[ys, xs]
+
+    best = (None, None, -1.0)
+    for th in np.arange(theta_hint - angle_sweep, theta_hint + angle_sweep + 1e-6, angle_step):
+        rho_peak, peak_val = weighted_rho_hist(xs, ys, weights, th, est_rho=None, bin_size=1.0)
+        if rho_peak is None:
+            continue
+        # continuidade aproximada num band estreito
+        band = 2
+        H, W = edges_u8.shape
+        diag = int(np.hypot(H, W))
+        a, b = np.cos(th), np.sin(th)
+        x0, y0 = a*rho_peak, b*rho_peak
+        p1 = (int(x0 + diag*(-b)), int(y0 + diag*(a)))
+        p2 = (int(x0 - diag*(-b)), int(y0 - diag*(a)))
+        band_mask = np.zeros_like(edges_u8, np.uint8)
+        cv2.line(band_mask, p1, p2, 255, 2*band+1, cv2.LINE_8)
+        hits = cv2.countNonZero(cv2.bitwise_and(band_mask, edges_u8))
+        score = float(peak_val if peak_val is not None else 0.0) + 0.5*hits
+        if score > best[2]:
+            best = (th, rho_peak, score)
+    return best[0], best[1]
+
+def extract_segment_by_profile(edges_u8, rho, theta, band_px, win=PROFILE_WIN,
+                               min_dens=PROFILE_MIN_DENS, max_gap=PROFILE_MAX_GAP):
+    H, W = edges_u8.shape
+    diag = int(np.hypot(H, W))
+    a, b = np.cos(theta), np.sin(theta)
+    x0, y0 = a*rho, b*rho
+    p1 = (int(x0 + diag*(-b)), int(y0 + diag*(a)))
+    p2 = (int(x0 - diag*(-b)), int(y0 - diag*(a)))
+
+    band_mask = np.zeros_like(edges_u8, np.uint8)
+    cv2.line(band_mask, p1, p2, 255, 2*band_px+1, cv2.LINE_8)
+    M = cv2.bitwise_and(band_mask, edges_u8)
+
+    vx, vy = -np.sin(theta), np.cos(theta)
+    ys, xs = np.where(M > 0)
+    if xs.size < 20:
+        return None
+    t = xs*vx + ys*vy
+    tmin, tmax = float(t.min()), float(t.max())
+    nbins = max(200, int((tmax - tmin) / 1.0))
+    hist, edges = np.histogram(t, bins=nbins, range=(tmin, tmax))
+
+    k = max(3, int(win)|1)
+    ker = np.ones(k, np.float32)/float(k)
+    prof = np.convolve(hist.astype(np.float32), ker, mode='same')
+    prof_norm = prof / float(max(1, 2*band_px+1))
+    thr = float(min_dens)
+    on = (prof_norm >= thr).astype(np.uint8)
+
+    gap = 0; best=(0, -1, -1)
+    i0 = None
+    for i, v in enumerate(on):
+        if v:
+            if i0 is None: i0 = i
+            gap = 0
+        else:
+            if i0 is not None:
+                gap += 1
+                if gap > max_gap:
+                    L = i - gap - i0
+                    if L > best[0]:
+                        best = (L, i0, i-gap)
+                    i0 = None; gap = 0
+    if i0 is not None:
+        L = len(on) - i0
+        if L > best[0]:
+            best = (L, i0, len(on)-1)
+    if best[0] <= 0:
+        return None
+
+    tA = 0.5*(edges[best[1]] + edges[best[1]+1])
+    tB = 0.5*(edges[best[2]] + edges[best[2]+1])
+
+    def clamp_pt(x, y):
+        return (int(np.clip(x, 0, W-1)), int(np.clip(y, 0, H-1)))
+    pA = clamp_pt(x0 + tA*vx, y0 + tA*vy)
+    pB = clamp_pt(x0 + tB*vx, y0 + tB*vy)
+    if pA == pB:
+        return None
+    return pA, pB
+
+def fit_line_ransac_weighted(edges_u8, coh_map, resp_map, dist_th=3.0, iters=400):
+    ys, xs = np.where(edges_u8 > 0)
+    if xs.size < 50: 
+        return None, None
+    w = build_weight_map(edges_u8, coh_map, resp_map)[ys, xs]
+    ps = w / (w.sum() + 1e-6)
+    best = (None, None, -1.0)
+    H, W = edges_u8.shape
+    for _ in range(iters):
+        i, j = np.random.choice(len(xs), size=2, replace=False, p=ps)
+        x1,y1 = xs[i], ys[i]; x2,y2 = xs[j], ys[j]
+        if x1==x2 and y1==y2: 
+            continue
+        a = y1 - y2; b = x2 - x1; c = x1*y2 - x2*y1
+        theta = np.arctan2(b, a) % np.pi
+        rho = (x1*np.cos(theta) + y1*np.sin(theta))
+        d = np.abs(a*xs + b*ys + c) / (np.hypot(a,b) + 1e-6)
+        inl = d <= dist_th
+        score = float((w[inl]).sum())
+        if score > best[2]:
+            best = (theta, rho, score)
+    return best[0], best[1]
 
 def ang_diff_deg(a, b):
     d = abs(a - b) % 180.0
@@ -627,25 +735,6 @@ def dominant_angle(thetas_rad, weights=None):
     th_star_deg = 0.5 * (bins[idx] + bins[idx+1])
     return np.radians(th_star_deg)
 
-def refine_rho_histogram(edges_u8, theta, est_rho=None, search=50, bin_size=1.0):
-    ys, xs = np.where(edges_u8 > 0)
-    if xs.size < 50:
-        return est_rho
-    rho_vals = xs * math.cos(theta) + ys * math.sin(theta)
-    if est_rho is not None:
-        sel = np.abs(rho_vals - est_rho) <= float(search)
-        rho_vals = rho_vals[sel]
-        if rho_vals.size < 30:
-            return est_rho
-    rmin, rmax = float(rho_vals.min()), float(rho_vals.max())
-    nbins = max(10, int(math.ceil((rmax - rmin) / bin_size)))
-    hist, edges = np.histogram(rho_vals, bins=nbins, range=(rmin, rmax))
-    if hist.max() <= 0:
-        return est_rho
-    k = int(np.argmax(hist))
-    rho_peak = 0.5 * (edges[k] + edges[k+1])
-    return rho_peak
-
 def oriented_close_one(img_u8, theta_deg, length=61):
     ksz = int(length) | 1
     ker = np.zeros((ksz, ksz), np.uint8)
@@ -661,23 +750,30 @@ for img_path in sorted(files, key=num_key):
     name = img_path.stem
     print(f"[+] {img_path}")
 
-    # ---------- Carrega ----------
+    # ---------- Carrega original ----------
     img0 = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
     if img0 is None:
         print("    (skip: cannot read)"); continue
     H0, W0 = img0.shape
     scale = min(1.0, PROC_MAX_SIDE / float(max(H0, W0)))
 
-    # ---------- Artefatos verticais ----------
+    # ---------- Remove artefatos verticais ----------
     vmask_strict = detect_vertical_artifacts_strict(img0, tol=VERT_TOL, min_run_r=VERT_MIN_RUN_R, max_width=VERT_MAX_WIDTH)
-    img0_clean = cv2.inpaint(img0, vmask_strict, 3, cv2.INPAINT_TELEA) if np.count_nonzero(vmask_strict) else img0.copy()
+    if np.count_nonzero(vmask_strict):
+        img0_clean = cv2.inpaint(img0, vmask_strict, 3, cv2.INPAINT_TELEA)
+    else:
+        img0_clean = img0.copy()
     cv2.imwrite(str(DBG_DIR / f"{name}_vertical_artifacts_mask.png"), vmask_strict)
 
     # ---------- Downscale ----------
-    base_orig = cv2.resize(img0_clean, (int(round(W0*scale)), int(round(H0*scale))), interpolation=cv2.INTER_AREA) if scale < 1.0 else img0_clean.copy()
+    if scale < 1.0:
+        newW, newH = int(round(W0*scale)), int(round(H0*scale))
+        base_orig = cv2.resize(img0_clean, (newW, newH), interpolation=cv2.INTER_AREA)
+    else:
+        base_orig = img0_clean.copy()
     H, W = base_orig.shape
 
-    # ---------- Escalas ----------
+    # Escala de parâmetros base
     MEDIAN_K_S  = scale_len(MEDIAN_K, scale, odd=True, minv=3)
     BG_K_S      = scale_len(BG_K, scale, odd=True, minv=15)
     LINE_KLEN_S = scale_len(LINE_KLEN, scale, odd=True, minv=15)
@@ -695,10 +791,11 @@ for img_path in sorted(files, key=num_key):
     BIG_STAR_MIN_A_S   = scale_area(BIG_STAR_MIN_A,   scale, minv=80)
     BIG_STAR_GROW_PX_S = scale_len(BIG_STAR_GROW_PX,  scale, minv=5)
 
-    # ---------- Enhance ----------
+    # ---------- Enhance base ----------
     base = percentile_stretch(base_orig, PERC_LOW, PERC_HIGH)
     base = apply_clahe(base, CLAHE_CLIP, CLAHE_TILE)
 
+    # ---------- Métricas + auto-tune ----------
     metrics = measure_scene(base)
     ov = auto_tune(metrics, scale)
 
@@ -721,10 +818,13 @@ for img_path in sorted(files, key=num_key):
     SEG_DILATE_ALONG       = ov.get("SEG_DILATE_ALONG", SEG_DILATE_ALONG)
     NO_TRAIL_GUARD         = ov.get("NO_TRAIL_GUARD", False)
     CLOSE_K_S              = max(1, scale_len(ov.get("CLOSE_K", CLOSE_K), scale))
-    COH_THR                = float(ov.get("COH_THR", 0.14))
-    COH_THR = min(COH_THR, 0.14)   # garante que não ficará acima de 0.14
+    COH_THR                = float(ov.get("COH_THR", 0.18))
 
-    # ---------- Big stars / halos ----------
+    if not NO_TRAIL_GUARD and RESP_PERC_STRONG >= 98.0:
+        SMALL_STAR_Q = min(SMALL_STAR_Q, 98.8)
+        SMALL_STAR_MAX_A_S = max(SMALL_STAR_MAX_A_S, 30)
+
+    # ---------- Big stars / halos (excluir) ----------
     big_mask = detect_big_stars(base, BIG_STAR_Q, BIG_STAR_MIN_A_S, BIG_STAR_GROW_PX_S)
     cv2.imwrite(str(DBG_DIR / f"{name}_big_star_mask.png"), big_mask)
 
@@ -757,12 +857,12 @@ for img_path in sorted(files, key=num_key):
     edges_all_raw[big_mask>0] = 0
     edges_gated   = cv2.bitwise_and(edges_all_raw, gate)
 
-    # --- Coerência (para limitar comprimento; sem alterar o resto) ---
-    coh_mask, coh_vis, ori_deg = coherence_gate(base, win=11, thr=COH_THR)
+    # --- Coherence gate ---
+    coh_mask, coh_vis, ori_deg, coh_map = coherence_gate(base, win=9, thr=COH_THR)
     cv2.imwrite(str(DBG_DIR / f"{name}_coherence.png"), coh_vis)
-
-    # ---------- Morfologia + fechamento direcional (original) ----------
     edges_union = cv2.bitwise_and(edges_gated, coh_mask)
+
+    # ---------- Morfologia + fechamento direcional ----------
     if OPEN_K_S>1:
         edges_union = cv2.morphologyEx(edges_union, cv2.MORPH_OPEN,  cv2.getStructuringElement(cv2.MORPH_RECT,(OPEN_K_S,OPEN_K_S)), 1)
     if CLOSE_K_S>1:
@@ -772,7 +872,7 @@ for img_path in sorted(files, key=num_key):
     if np.count_nonzero(edges_union) < 4000:
         edges_union = directional_close(edges_union, length=DIR_CLOSE_LEN_S+10, step=5)
 
-    # Strong-only
+    # Strong-only (para Hough auxiliar)
     edges_strong = cv2.bitwise_or(mask_s, cv2.bitwise_or(edges_s_pos, edges_s_neg))
     edges_strong[big_mask>0] = 0
     if OPEN_K_S>1:
@@ -782,6 +882,7 @@ for img_path in sorted(files, key=num_key):
     if USE_DIR_CLOSE:
         edges_strong = directional_close(edges_strong, length=DIR_CLOSE_LEN_STRONG_S, step=DIR_CLOSE_STEP)
 
+    # Debug reduzido
     cv2.imwrite(str(DBG_DIR / f"{name}_edges_union.png"),  edges_union)
     cv2.imwrite(str(DBG_DIR / f"{name}_edges_strong.png"), edges_strong)
 
@@ -800,6 +901,7 @@ for img_path in sorted(files, key=num_key):
         band=SUPPORT_BAND_S, min_ratio=SUPPORT_MIN_RATIO, min_abs=SUPPORT_MIN_ABS_S
     )
 
+    # ---------- Poda por direção adaptativa ----------
     rho_tmp, th_tmp, hits = prune_by_theta_bins(
         rho_peaks, theta_peaks, edges_union, band=SUPPORT_BAND_S,
         bin_w_deg=1.5, keep_bins=3
@@ -813,6 +915,17 @@ for img_path in sorted(files, key=num_key):
         bin_w_deg=1.5, keep_bins=keep_bins0
     )
 
+    # ---------- Pós-processo orientado ----------
+    theta_star = dominant_angle(theta_peaks) if len(theta_peaks)>0 else None
+
+    edges_for_fit = edges_union.copy()
+    if theta_star is not None and ori_deg is not None:
+        delta = np.abs(np.vectorize(ang_diff_deg)(ori_deg, np.degrees(theta_star)))
+        ori_gate = (delta <= 12.0).astype(np.uint8) * 255
+        edges_for_fit = cv2.bitwise_and(edges_for_fit, ori_gate)
+    if theta_star is not None:
+        edges_for_fit = oriented_close_one(edges_for_fit, np.degrees(theta_star), length=max(41, DIR_CLOSE_LEN_S+20))
+
     # ---------- Accumulator preview ----------
     acc_img_pts = np.zeros_like(hU, dtype=np.uint8)
     for rho, theta in zip(rho_peaks, theta_peaks):
@@ -821,47 +934,80 @@ for img_path in sorted(files, key=num_key):
     cv2.imwrite(str(ACC_DIR / f"{name}_acc_points.png"), acc_img_pts)
     acc_preview = render_acc_preview(angU, rhoU, rho_peaks, theta_peaks, max_w=TILE_W, min_px=3)
 
-    # ---------- Extrair segmentos (AGORA limitando por coerência) ----------
-    segments_scaled = []
-    for rho, theta in zip(rho_peaks, theta_peaks):
-        # 1) tentar com coerência (sem morfologia adicional)
-        seg = extract_segment_from_edges_coh(
-            edges_union, coh_mask, ori_deg, rho, theta,
-            band=SEG_BAND_S, min_len=SEG_MIN_LEN_S,
-            ang_tol_deg=12.0, max_gap_px=8
-        )
-        # 2) se falhar, usa método antigo (apenas edges)
-        if seg is None:
-            seg = extract_segment_from_edges(
-                edges_union, rho, theta,
-                band=SEG_BAND_S, min_len=SEG_MIN_LEN_S,
-                dilate_along=SEG_DILATE_ALONG, endpoint_r=SEG_ENDPOINT_RADIUS
-            )
-        # 3) fallback final: reta longa
-        if seg is None:
-            diag = int(np.hypot(H, W))
-            a, b = math.cos(theta), math.sin(theta)
-            x0, y0 = a*rho, b*rho
-            seg = ((int(x0 + diag*(-b)), int(y0 + diag*(a))),
-                   (int(x0 - diag*(-b)), int(y0 - diag*(a))))
-        segments_scaled.append(seg)
+    # ---------- Traçar as linhas (NOVO fluxo) ----------
+    resp_map = np.maximum(resp_s.astype(np.float32), resp_w.astype(np.float32))
 
-    # Reescala p/ original
+    segments_scaled = []
+    if len(theta_peaks) > 0:
+        for rho, th in zip(rho_peaks, theta_peaks):
+            th0 = theta_star if theta_star is not None else th
+            th_ref, rho_ref = refine_theta_rho_local(
+                edges_for_fit, coh_map, resp_map, th0, ori_deg,
+                angle_sweep=np.radians(ANGLE_SWEEP_DEG),
+                angle_step=np.radians(ANGLE_STEP_DEG),
+                ori_tol_deg=ORI_TOL_DEG
+            )
+            if th_ref is None:
+                th_ref, rho_ref = fit_line_ransac_weighted(edges_for_fit, coh_map, resp_map)
+                if th_ref is None:
+                    continue
+
+            band_prof = max(1, int(round(PROFILE_BAND_MULT * SEG_BAND_S)))
+            seg = extract_segment_by_profile(
+                edges_for_fit, rho_ref, th_ref,
+                band_px=band_prof, win=PROFILE_WIN,
+                min_dens=PROFILE_MIN_DENS, max_gap=PROFILE_MAX_GAP
+            )
+            if seg is None:
+                seg = extract_segment_from_edges(
+                    edges_for_fit, rho_ref, th_ref,
+                    band=SEG_BAND_S, min_len=SEG_MIN_LEN_S,
+                    dilate_along=SEG_DILATE_ALONG, endpoint_r=SEG_ENDPOINT_RADIUS
+                )
+            if seg is None:
+                Ht, Wt = edges_for_fit.shape
+                diag = int(np.hypot(Ht, Wt))
+                a, b = np.cos(th_ref), np.sin(th_ref)
+                x0, y0 = a*rho_ref, b*rho_ref
+                seg = ((int(x0 + diag*(-b)), int(y0 + diag*(a))),
+                       (int(x0 - diag*(-b)), int(y0 - diag*(a))))
+            # checagem de coerência média (no scale de processamento)
+            p1, p2 = seg
+            mask = np.zeros_like(edges_for_fit, np.uint8)
+            cv2.line(mask, p1, p2, 255, DRAW_THICK, cv2.LINE_8)
+            cm = float(coh_map[mask>0].mean()) if np.any(mask>0) else 0.0
+            if cm >= MIN_MEAN_COH:
+                segments_scaled.append(seg)
+    else:
+        th_ref, rho_ref = fit_line_ransac_weighted(edges_for_fit, coh_map, resp_map)
+        if th_ref is not None:
+            band_prof = max(1, int(round(PROFILE_BAND_MULT * SEG_BAND_S)))
+            seg = extract_segment_by_profile(edges_for_fit, rho_ref, th_ref,
+                                             band_px=band_prof, win=PROFILE_WIN,
+                                             min_dens=PROFILE_MIN_DENS, max_gap=PROFILE_MAX_GAP)
+            if seg is not None:
+                segments_scaled.append(seg)
+
+    # Reescalar p/ original
     def up(pt):
         if scale >= 1.0: return pt
         return (int(round(pt[0]/scale)), int(round(pt[1]/scale)))
     segments_orig = [(up(p1), up(p2)) for (p1,p2) in segments_scaled]
 
-    # Merge + rejeições
-    segments_orig = merge_colinear_segments(segments_orig, ang_tol_deg=1.2, gap_max=60)
+    # Fusão + rejeições finais
+    segments_orig = merge_colinear_segments(segments_orig, ang_tol_deg=1.0, gap_max=40)
     segments_orig = reject_1px_vertical_segments(segments_orig, img0, tol=2, min_run=0.10)
 
     # ---------- Desenho ----------
-    on_original = cv2.cvtColor(img0, cv2.COLOR_GRAY2BGR)
-    lines_only  = np.zeros_like(img0, dtype=np.uint8)
-    for p1, p2 in segments_orig:
-        cv2.line(on_original, p1, p2, (255,255,255), DRAW_THICK, cv2.LINE_8)
-        cv2.line(lines_only,  p1, p2, 255,            DRAW_THICK, cv2.LINE_8)
+    if NO_TRAIL_GUARD and len(segments_orig) == 0:
+        on_original = cv2.cvtColor(img0, cv2.COLOR_GRAY2BGR)
+        lines_only  = np.zeros_like(img0, dtype=np.uint8)
+    else:
+        on_original = cv2.cvtColor(img0, cv2.COLOR_GRAY2BGR)
+        lines_only  = np.zeros_like(img0, dtype=np.uint8)
+        for p1, p2 in segments_orig:
+            cv2.line(on_original, p1, p2, (255,255,255), DRAW_THICK, cv2.LINE_8)
+            cv2.line(lines_only,  p1, p2, 255,            DRAW_THICK, cv2.LINE_8)
 
     # ---------- Saves ----------
     cv2.imwrite(str(INV_DIR   / f"{name}_inversed.png"), on_original)
@@ -874,7 +1020,7 @@ for img_path in sorted(files, key=num_key):
             T(base_orig,   "Original (downscaled)"),
             T(acc_preview, "Accumulator (points, rho–theta scaled)"),
             T(xw,          "Preprocessed (weak): stretch+CLAHE+inpaint+flatten+small-star"),
-            T(edges_union, "Edges (union ∧ coherence)"),
+            T(edges_union, "Edges (union + coherence + dir-close)"),
             T(on_original, "Overlay (white segments)"),
             T(lines_only,  "Lines only (white)")
         ],
