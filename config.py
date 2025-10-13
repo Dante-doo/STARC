@@ -64,6 +64,15 @@ SLICE_TILE         = PATCH_SIZE
 SLICE_GRID_R       = GRID_ROWS
 SLICE_GRID_C       = GRID_COLS
 
+# Downscale do full-frame antes de fatiar:
+#  - 0   => não redimensiona (usa resolução nativa)
+#  - > 0 => limita o maior lado a este valor, preservando aspecto
+SLICE_DOWNSCALE_MAXSIDE = 2048  # deixe alinhado ao HO_DEFAULT_RES
+
+# Interpolação (usa strings; o slice.py converte p/ PIL):
+# valores aceitos: "nearest" | "bilinear" | "bicubic" | "lanczos"
+SLICE_RESAMPLE_RAW  = "lanczos"   # qualidade melhor para imagem contínua
+SLICE_RESAMPLE_MASK = "nearest"   # preserva rótulos da máscara
 # ============================== label/augment/split ==========================
 LABELS_ALL_CSV = LABELS_DIR / "all_labels.csv"
 AUGMENT_ANGLES = [90, 180, 270]
