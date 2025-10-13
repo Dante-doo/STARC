@@ -1,172 +1,185 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# Gera patches "combined" 3-canais (RAW, ACC-resized, INV).
+# Para AUG:
+#   1) tenta achar ACC/INV do Hough rotacionados (fullX_rot090 / fullX_90)
+#   2) se não existir, usa ACC/INV **base** e ROTACIONA no ato para o ângulo do RAW aug
+
+import re
+import argparse
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import cv2
+import numpy as np
 
-# ============================== core paths ===================================
-ROOT            = Path(__file__).resolve().parents[1]
-IMAGES_DIR      = ROOT / "images"
-FULL_DIR        = IMAGES_DIR / "full"
-PATCHES_DIR     = IMAGES_DIR / "patches"
-LABELS_DIR      = ROOT / "labels"
-MODELS_DIR      = ROOT / "models"
-RESULTS_DIR     = ROOT / "results"
-RESULTS_VIS_DIR = RESULTS_DIR / "vis"
+from code.config import (
+    RAW_STD_DIR, RAW_AUG_DIR,
+    PATCH_HOUGH_ACC_DIR, PATCH_HOUGH_INV_DIR,
+    COMBINED_STD_DIR, COMBINED_AUG_DIR,
+    SFX_R, SFX_H, SFX_INV, SFX_C,
+    PATCH_SIZE,
+    COMBINED_JOBS,
+)
 
-# ============================== full images ==================================
-FULL_RAW_DIR    = FULL_DIR / "raw"
-FULL_MASKS_DIR  = FULL_DIR / "full_asta_masks"            # optional
-FULL_HOUGH_DIR     = FULL_DIR / "hough"
-FULL_HOUGH_ACC_DIR = FULL_HOUGH_DIR / "accumulator"
-FULL_HOUGH_INV_DIR = FULL_HOUGH_DIR / "inversed"
+RE_STD = re.compile(rf"^(full\d+)_([0-9]+)_([0-9]+)_{re.escape(SFX_R)}\.png$")
+RE_AUG = re.compile(rf"^(full\d+)_([0-9]+)_([0-9]+)_{re.escape(SFX_R)}_(\d+)\.png$")
 
-# ============================== patches & naming ==============================
-RAW_STD_DIR    = PATCHES_DIR / "raw"   / "standart"
-RAW_AUG_DIR    = PATCHES_DIR / "raw"   / "augment"
-HOUGH_STD_DIR  = PATCHES_DIR / "hough" / "standart"
-HOUGH_AUG_DIR  = PATCHES_DIR / "hough" / "augment"
-MASK_STD_DIR   = PATCHES_DIR / "mask"  / "standart"
+def rotate_k(img: np.ndarray, ang: int) -> np.ndarray:
+    k = (ang // 90) % 4
+    if k == 0: return img
+    return np.ascontiguousarray(np.rot90(img, k=k))
 
-SFX_R = "r"   # raw     (fullX_row_col_r.png)
-SFX_H = "h"   # hough   (fullX_row_col_h.png)
-SFX_M = "m"   # mask    (fullX_row_col_m.png)
+def iter_raw_patches() -> list[tuple[Path, bool]]:
+    out = []
+    if RAW_STD_DIR.exists():
+        for d in sorted(RAW_STD_DIR.glob("full*")):
+            if d.is_dir():
+                out += [(p, False) for p in sorted(d.glob(f"*_{SFX_R}.png"))]
+    if RAW_AUG_DIR.exists():
+        for d in sorted(RAW_AUG_DIR.glob("full*")):
+            if d.is_dir():
+                out += [(p, True) for p in sorted(d.glob(f"*_{SFX_R}_*.png"))]
+    return out
 
-PATCH_SIZE = 224
-GRID_ROWS  = 47
-GRID_COLS  = 47
+def parse_std_name(name: str):
+    m = RE_STD.match(name)
+    if not m: return None
+    return m.group(1), int(m.group(2)), int(m.group(3))
 
-# ============================== slice ========================================
-SLICE_IN_RAW_DIR   = FULL_RAW_DIR
-SLICE_IN_MASK_DIR  = FULL_MASKS_DIR
-SLICE_OUT_RAW_DIR  = RAW_STD_DIR
-SLICE_OUT_MASK_DIR = MASK_STD_DIR
-SLICE_TILE         = PATCH_SIZE
-SLICE_GRID_R       = GRID_ROWS
-SLICE_GRID_C       = GRID_COLS
+def parse_aug_name(name: str):
+    m = RE_AUG.match(name)
+    if not m: return None
+    return m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))
 
-# ============================== label/augment/split ==========================
-LABELS_ALL_CSV = LABELS_DIR / "all_labels.csv"
-AUGMENT_ANGLES = [90, 180, 270]
+def load_gray(path: Path, fallback_shape: tuple[int,int] | None = None) -> np.ndarray:
+    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if img is None and fallback_shape is not None:
+        return np.zeros(fallback_shape, np.uint8)
+    return img
 
-SPLIT_TRAIN = 0.70
-SPLIT_VAL   = 0.15
-SPLIT_TEST  = 0.15
-SPLIT_SEED  = 42
-SPLIT_GROUP_FROM = "parent"
-SPLIT_STRATIFY   = True
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
-TRAIN_CSV = LABELS_DIR / "train.csv"
-VAL_CSV   = LABELS_DIR / "val.csv"
-TEST_CSV  = LABELS_DIR / "test.csv"
+def first_existing(cands: list[Path]) -> Path | None:
+    for p in cands:
+        if p.exists(): return p
+    return None
 
-# ============================== train/test (main) ============================
-TRAIN_ARCH            = "resnet18"     # "resnet18" | "cnn"(NI)
-TRAIN_MODALITY        = "raw"          # "raw" | "hough" | "combined"
-TRAIN_EPOCHS          = 12
-TRAIN_BATCH_SIZE      = 128
-TRAIN_LR              = 1e-3
-TRAIN_WEIGHT_DECAY    = 1e-4
-TRAIN_WORKERS         = 8
-TRAIN_PREFETCH        = 2
-TRAIN_AUG_FLIPS       = True
-TRAIN_USE_IMAGENET    = True
-TRAIN_FREEZE_BACKBONE = False
-TRAIN_BALANCE_SAMPLER = False
-TRAIN_POS_WEIGHT_CLIP = (0.5, 20.0)
-TRAIN_LOG_INTERVAL    = 100
-TRAIN_VAL_EVERY       = 1
-TRAIN_AMP             = True
-TRAIN_TF32            = True
-TRAIN_CLIP_NORM       = 0.0
+def build_paths(raw_path: Path, is_aug: bool):
+    n = raw_path.name
+    if is_aug:
+        parsed = parse_aug_name(n)
+        if not parsed: return None
+        full_id, l, c, ang = parsed
 
-DDP_ENABLED  = True
-DDP_BACKEND  = "nccl"
+        hid_rot   = f"{full_id}_rot{int(ang):03d}"   # prioridade
+        hid_plain = f"{full_id}_{int(ang)}"
 
-CKPT_DIR        = MODELS_DIR / "resnet"
-CKPT_NAME       = "last.pt"
-PRED_OUT_DIR    = RESULTS_DIR / "predictions"
-METRICS_OUT_DIR = RESULTS_DIR / "metrics"
-TEST_BATCH_SIZE = 256
-RESULTS_TABLE_CSV = RESULTS_DIR / "summary.csv"
+        # caminhos Hough AUG (se existirem)
+        acc_rot = [
+            PATCH_HOUGH_ACC_DIR / hid_rot   / f"{hid_rot}_{l:02d}_{c:02d}_{SFX_H}.png",
+            PATCH_HOUGH_ACC_DIR / hid_plain / f"{hid_plain}_{l:02d}_{c:02d}_{SFX_H}.png",
+        ]
+        inv_rot = [
+            PATCH_HOUGH_INV_DIR / hid_rot   / f"{hid_rot}_{l:02d}_{c:02d}_{SFX_INV}.png",
+            PATCH_HOUGH_INV_DIR / hid_plain / f"{hid_plain}_{l:02d}_{c:02d}_{SFX_INV}.png",
+        ]
 
-# ============================== Hough (full→ROI / patches) ===================
-HOUGH_ACC_INPUT_GLOB  = "full*.png"
-HOUGH_ACC_NUM_THETA   = 360
-HOUGH_FULL_DOWNSCALE  = 1
+        # caminhos Hough BASE (fallback para rotacionar)
+        acc_base = PATCH_HOUGH_ACC_DIR / full_id / f"{full_id}_{l:02d}_{c:02d}_{SFX_H}.png"
+        inv_base = PATCH_HOUGH_INV_DIR / full_id / f"{full_id}_{l:02d}_{c:02d}_{SFX_INV}.png"
 
-# Edge variants (picked by unsupervised heatmap score)
-HOUGH_AUTO_VARIANTS = [
-    {"edge": "sobel_otsu", "open": 0, "close": 0, "clahe": True},
-    {"edge": "sobel_otsu", "open": 3, "close": 0, "clahe": True},
-    {"edge": "sobel_otsu", "open": 3, "close": 3, "clahe": True},
-    {"edge": "canny",      "open": 3, "close": 0, "clahe": True},
-]
+        out_dir = COMBINED_AUG_DIR / full_id
+        out = out_dir / f"{full_id}_{l}_{c}_{SFX_C}_{ang}.png"
 
-# Canny sensitivity by percentiles of |grad|
-CANNY_PERC_LOW  = 90.0
-CANNY_PERC_HIGH = 99.5
-CANNY_PERC_LOW_FALLBACK  = 85.0
-CANNY_PERC_HIGH_FALLBACK = 99.0
+        return dict(full_id=full_id, l=l, c=c, ang=ang,
+                    acc_rot_opts=acc_rot, inv_rot_opts=inv_rot,
+                    acc_base=acc_base, inv_base=inv_base,
+                    out_dir=out_dir, out=out, is_aug=True)
+    else:
+        parsed = parse_std_name(n)
+        if not parsed: return None
+        full_id, l, c = parsed
+        acc = PATCH_HOUGH_ACC_DIR / full_id / f"{full_id}_{l:02d}_{c:02d}_{SFX_H}.png"
+        inv = PATCH_HOUGH_INV_DIR / full_id / f"{full_id}_{l:02d}_{c:02d}_{SFX_INV}.png"
+        out_dir = COMBINED_STD_DIR / full_id
+        out = out_dir / f"{full_id}_{l}_{c}_{SFX_C}.png"
+        return dict(full_id=full_id, l=l, c=c, ang=None,
+                    acc=acc, inv=inv, out_dir=out_dir, out=out, is_aug=False)
 
-# Heatmap score S = w_peak*peakiness(topK) + w_anis*anisotropy
-HOUGH_SCORE_TOPK   = 64
-HOUGH_SCORE_W_PEAK = 0.7
-HOUGH_SCORE_W_ANIS = 0.3
+def make_one(raw_path: Path, is_aug: bool, overwrite: bool=False) -> tuple[Path, bool]:
+    meta = build_paths(raw_path, is_aug)
+    if meta is None:
+        return raw_path, False
 
-# Peak selection (search percentile to reach K_min..K_max)
-HPOINTS_K_MIN         = 3
-HPOINTS_K_MAX         = 12
-HPOINTS_PMIN          = 99.50
-HPOINTS_PMAX          = 99.99
-HPOINTS_BIN_STEPS     = 8
-HPOINTS_MIN_DIST_RHO  = 100
-HPOINTS_MIN_ANGLE_DEG = 3.0
-HPOINTS_MAX_PEAKS     = 32
-HPOINTS_DOT_RADIUS    = 2
-HPOINTS_BG_ALPHA      = 0.12
+    out_path: Path = meta["out"]
+    if out_path.exists() and not overwrite:
+        return out_path, True
 
-# Refinement (fix small offsets)
-HOUGH_REFINE_PEAK_WINDOW      = 7     # accumulator window (odd)
-HOUGH_REFINE_LOCAL_DRHO_PX    = 6     # ±rho search (px)
-HOUGH_REFINE_LOCAL_DTHETA_DEG = 0.4   # ±theta search (deg)
-HOUGH_REFINE_LOCAL_STEP_THETA = 0.1   # step (deg)
+    ensure_dir(meta["out_dir"])
 
-# Artifact handling (column/row defects)
-ARTIF_KMAD           = 6.0   # k*MAD deviation to flag col/row
-ARTIF_MIN_RUN        = 8     # min contiguous run to consider artifact
-ANGLE_VETO_DEG       = 2.0   # width around 0° or 90° to penalize
-ANGLE_VETO_WEIGHT    = 0.2   # multiplier for penalized angle bins
+    raw = load_gray(raw_path)
+    if raw is None:
+        return out_path, False
 
-# Line validation / pruning
-HOUGH_INV_LINE_THICKNESS = 2
-HOUGH_LINE_MINLEN_FULL   = 2000
-HOUGH_ONOFF_OFFSET_PX    = 3
-HOUGH_KEEP_TOPK          = 6
-HOUGH_KEEP_SCORE_PCT     = 98.0
+    if not is_aug:
+        inv = load_gray(meta["inv"], fallback_shape=(PATCH_SIZE, PATCH_SIZE))
+        acc = load_gray(meta["acc"])
+        acc_res = np.zeros((PATCH_SIZE, PATCH_SIZE), np.uint8) if acc is None else cv2.resize(acc, (PATCH_SIZE, PATCH_SIZE), interpolation=cv2.INTER_LINEAR)
+    else:
+        ang = int(meta["ang"])
+        # tenta Hough AUG
+        acc_r = first_existing(meta["acc_rot_opts"])
+        inv_r = first_existing(meta["inv_rot_opts"])
+        if acc_r is not None and inv_r is not None:
+            inv = load_gray(inv_r, fallback_shape=(PATCH_SIZE, PATCH_SIZE))
+            acc = load_gray(acc_r)
+            acc_res = np.zeros((PATCH_SIZE, PATCH_SIZE), np.uint8) if acc is None else cv2.resize(acc, (PATCH_SIZE, PATCH_SIZE), interpolation=cv2.INTER_LINEAR)
+        else:
+            # fallback: usa base e rotaciona
+            inv_b = load_gray(meta["inv_base"], fallback_shape=(PATCH_SIZE, PATCH_SIZE))
+            acc_b = load_gray(meta["acc_base"])
+            inv = rotate_k(inv_b, ang)
+            if acc_b is None:
+                acc_res = np.zeros((PATCH_SIZE, PATCH_SIZE), np.uint8)
+            else:
+                acc_b = cv2.resize(acc_b, (PATCH_SIZE, PATCH_SIZE), interpolation=cv2.INTER_LINEAR)
+                acc_res = rotate_k(acc_b, ang)
 
-# Continuity/width gates
-CONTINUITY_THR_PCT  = 90.0   # percentile of |grad| to count "on"
-CONTINUITY_MIN_FRAC = 0.55   # min fraction along the line above thr
-WIDTH_REL_THR       = 0.5    # level to measure width in normal profile
-WIDTH_MIN_PX        = 1.0
-WIDTH_MAX_PX        = 8.0
-WIDTH_PROFILE_HALF  = 8      # half-window (px) for normal profiles
-WIDTH_SAMPLES_ALONG = 30     # number of normal profiles along line
+    # normaliza tamanhos
+    if raw.shape != (PATCH_SIZE, PATCH_SIZE):
+        raw = cv2.resize(raw, (PATCH_SIZE, PATCH_SIZE), interpolation=cv2.INTER_AREA)
+    if inv.shape != (PATCH_SIZE, PATCH_SIZE):
+        inv = cv2.resize(inv, (PATCH_SIZE, PATCH_SIZE), interpolation=cv2.INTER_NEAREST)
 
-# ROI outputs
-ROI_IMG_DIR            = LABELS_DIR / "roi"
-ROI_OUT_CSV            = LABELS_DIR / "roi_candidates.csv"
-ROI_BAND_PX            = 8
-ROI_PATCH_MIN_PIXELS   = 300
-ROI_PATCH_MIN_RATIO    = 0.005
-ROI_VIS_DIR            = RESULTS_VIS_DIR / "roi_full"
+    combo = np.dstack([raw, acc_res, inv]).astype(np.uint8)
+    ok = cv2.imwrite(str(out_path), combo)
+    return out_path, ok
 
-# Patch Hough (input to ResNet)
-PATCH_THETA_DELTA_DEG  = 6.0
+def main():
+    ap = argparse.ArgumentParser(description="Gerar patches combined (RAW, ACC224, INV) com fallback de rotação do ACC/INV base.")
+    ap.add_argument("--jobs", type=int, default=COMBINED_JOBS, help="threads para I/O (default: config.COMBINED_JOBS)")
+    ap.add_argument("--overwrite", action="store_true", help="regravar arquivos já existentes")
+    args = ap.parse_args()
 
-# Parallelism
-HOUGH_FULL_JOBS  = 1
-HOUGH_PATCH_JOBS = 1
+    raws = iter_raw_patches()
+    if not raws:
+        raise FileNotFoundError(f"Nenhum RAW patch encontrado em {RAW_STD_DIR} ou {RAW_AUG_DIR}")
 
-# ============================== combined =====================================
-COMBINED_ALPHA = 0.5
+    print(f"[combined] total RAW patches: {len(raws)}  | jobs={args.jobs}  | overwrite={args.overwrite}")
+
+    ok = skip = fail = 0
+    with ThreadPoolExecutor(max_workers=max(1, int(args.jobs))) as ex:
+        futs = [ex.submit(make_one, p, is_aug, args.overwrite) for (p, is_aug) in raws]
+        for fu in as_completed(futs):
+            out, res = fu.result()
+            if res is True: ok += 1
+            elif res is False: fail += 1
+            else: skip += 1
+
+    print(f"[combined] ok={ok}  skip={skip}  fail={fail}")
+    print(f"[combined] out: {COMBINED_STD_DIR}  |  {COMBINED_AUG_DIR}")
+
+if __name__ == "__main__":
+    main()

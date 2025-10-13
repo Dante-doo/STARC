@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# Single source of truth for paths and knobs used by slice/label/hough/combined/train.
+
 from pathlib import Path
+import os
+import numpy as np
 
 # ============================== core paths ===================================
 ROOT            = Path(__file__).resolve().parents[1]
@@ -14,30 +18,46 @@ RESULTS_DIR     = ROOT / "results"
 RESULTS_VIS_DIR = RESULTS_DIR / "vis"
 
 # ============================== full images ==================================
-FULL_RAW_DIR    = FULL_DIR / "raw"
-FULL_MASKS_DIR  = FULL_DIR / "full_asta_masks"
-FULL_HOUGH_DIR     = FULL_DIR / "hough"
-FULL_HOUGH_ACC_DIR = FULL_HOUGH_DIR / "accumulator"
-FULL_HOUGH_INV_DIR = FULL_HOUGH_DIR / "inversed"
+# New layout: raw/standart and raw/augment
+FULL_RAW_BASE_DIR = FULL_DIR / "raw"
+FULL_RAW_STD_DIR  = FULL_RAW_BASE_DIR / "standart"
+FULL_RAW_AUG_DIR  = FULL_RAW_BASE_DIR / "augment"
+
+# Backward-compat alias used by slicing stage
+FULL_RAW_DIR    = FULL_RAW_STD_DIR
+
+FULL_MASKS_DIR = FULL_DIR / "full_asta_masks"
+
+# Hough (full)
+FULL_HOUGH_DIR        = FULL_DIR / "hough"
+FULL_HOUGH_INV_DIR    = FULL_HOUGH_DIR / "inverted"
+FULL_HOUGH_COH_DIR    = FULL_HOUGH_DIR / "coherence"
+FULL_HOUGH_FILT_DIR   = FULL_HOUGH_DIR / "filtered"
+FULL_HOUGH_FILTER_DIR = FULL_HOUGH_FILT_DIR  # alias consistent
 
 # ============================== patches & naming ==============================
-RAW_STD_DIR    = PATCHES_DIR / "raw"   / "standart"   # note: 'standart' per project
+RAW_STD_DIR    = PATCHES_DIR / "raw"   / "standart"
 RAW_AUG_DIR    = PATCHES_DIR / "raw"   / "augment"
-HOUGH_STD_DIR  = PATCHES_DIR / "hough" / "standart"
-HOUGH_AUG_DIR  = PATCHES_DIR / "hough" / "augment"
+# hough outputs under:
+PATCH_HOUGH_ACC_DIR = PATCHES_DIR / "hough" / "accumulator"
+PATCH_HOUGH_INV_DIR = PATCHES_DIR / "hough" / "inverted"
+
 MASK_STD_DIR   = PATCHES_DIR / "mask"  / "standart"
 
-SFX_R = "r"  # raw     (fullX_row_col_r.png)
-SFX_H = "h"  # hough   (fullX_row_col_h.png)
-SFX_M = "m"  # mask    (fullX_row_col_m.png)
+# File suffixes
+SFX_R   = "r"     # raw     -> fullX_row_col_r.png
+SFX_H   = "h"     # hough   -> points acc (per patch)
+SFX_M   = "m"     # mask    -> fullX_row_col_m.png
+SFX_INV = "inv"   # inverse -> fullX_row_col_inv.png
 
+# Patch geometry (S L I C E) — 224@9x9 on 2048 downscale (original full 10560)
 PATCH_SIZE = 224
-GRID_ROWS  = 47
-GRID_COLS  = 47
+GRID_ROWS  = 9
+GRID_COLS  = 9
 
 # ============================== slice ========================================
-SLICE_IN_RAW_DIR   = FULL_RAW_DIR
-SLICE_IN_MASK_DIR  = FULL_MASKS_DIR
+SLICE_IN_RAW_DIR   = FULL_RAW_STD_DIR
+SLICE_IN_MASK_DIR  = FULL_DIR / "full_asta_masks"
 SLICE_OUT_RAW_DIR  = RAW_STD_DIR
 SLICE_OUT_MASK_DIR = MASK_STD_DIR
 SLICE_TILE         = PATCH_SIZE
@@ -59,119 +79,159 @@ TRAIN_CSV = LABELS_DIR / "train.csv"
 VAL_CSV   = LABELS_DIR / "val.csv"
 TEST_CSV  = LABELS_DIR / "test.csv"
 
-# ============================== train/test ===================================
-TRAIN_ARCH            = "resnet18"       # "resnet18" | "cnn"(NI)
+# Try to keep base splits close to global pos_rate and target sizes
+SPLIT_ENFORCE_GLOBAL_POS_RATE = True
+SPLIT_TRIES = 1000
+SPLIT_ABS_TOL = 0.0025
+SPLIT_VERBOSE = True
+SPLIT_SIZE_TOL_FRAC = 0.01
+SPLIT_BALANCE_ITERS = 5000
+SPLIT_SCORE_SIZE_WEIGHT = 0.2
+
+# ============================== training =====================================
+TRAIN_ARCH            = "resnet18"       # currently only resnet18 implemented
 TRAIN_MODALITY        = "raw"            # "raw" | "hough" | "combined"
 TRAIN_EPOCHS          = 12
-TRAIN_BATCH_SIZE      = 128
+TRAIN_BATCH_SIZE      = 32
 TRAIN_LR              = 1e-3
-TRAIN_WEIGHT_DECAY    = 1e-4
-TRAIN_WORKERS         = 8
+TRAIN_WORKERS         = 4
 TRAIN_PREFETCH        = 2
-TRAIN_AUG_FLIPS       = True
-TRAIN_USE_IMAGENET    = True
+TRAIN_PRETRAINED      = True             # ImageNet weights
 TRAIN_FREEZE_BACKBONE = False
-TRAIN_BALANCE_SAMPLER = False
-TRAIN_POS_WEIGHT_CLIP = (0.5, 20.0)
-TRAIN_LOG_INTERVAL    = 100
-TRAIN_VAL_EVERY       = 1
-TRAIN_AMP             = True
+
+# Logging / validation cadence (needed by train.py)
+TRAIN_VAL_EVERY       = 1                # validate every N epochs
+TRAIN_LOG_INTERVAL    = 100              # steps between train logs
+
+# Loss (default focal for robustness to imbalance)
+TRAIN_LOSS            = "focal"          # "focal" | "bce"
+FOCAL_ALPHA           = 0.25
+FOCAL_GAMMA           = 2.0
+
+# DDP / perf
+TRAIN_DDP             = True
+TRAIN_CHANNELS_LAST   = False
+TRAIN_MIXED_PRECISION = False            # AMP
 TRAIN_TF32            = True
-TRAIN_CLIP_NORM       = 0.0
+TRAIN_COMPILE         = False
 
-DDP_ENABLED  = True
-DDP_BACKEND  = "nccl"
+# Weighted sampler / BCE pos_weight (used only if TRAIN_LOSS="bce")
+TRAIN_USE_SAMPLER     = False
+TRAIN_USE_POS_WEIGHT  = False
 
-CKPT_DIR        = MODELS_DIR / "resnet"
+# Inference threshold & sweep for validation
+TRAIN_THRESHOLD       = 0.50
+TRAIN_SELECT_METRIC   = "balacc"   # {'balacc','f1','f2'}
+TRAIN_SWEEP_MIN_T     = 0.10
+TRAIN_SWEEP_MAX_T     = 0.90
+TRAIN_SWEEP_STEPS     = 41         # step 0.02
+
+TRAIN_MIXED_PRECISION = True
+TRAIN_CHANNELS_LAST   = True   # também ajuda um pouco
+
+# Augment policy for the TRAIN SET rows (independent of TF flips in Dataset)
+# - "none": drop augmented rows, only base
+# - "rebalance": keep a subset of aug to match base pos_rate (plus cap per base)
+# - "all": keep all rows as-is
+TRAIN_AUG_POLICY      = "rebalance"
+TRAIN_MATCH_BASE_RATE = True
+TRAIN_TARGET_POS_RATE = None
+TRAIN_AUG_MAX_PER_BASE= 1
+
+# Checkpoints / results
+CKPT_DIR        = MODELS_DIR / "resnet"  # composed dynamically in train.py
 CKPT_NAME       = "last.pt"
-PRED_OUT_DIR    = RESULTS_DIR / "predictions"
-METRICS_OUT_DIR = RESULTS_DIR / "metrics"
-TEST_BATCH_SIZE = 256
-RESULTS_TABLE_CSV = RESULTS_DIR / "summary.csv"
+EVAL_BATCH_SIZE  = 32
+RESULTS_PREDS_DIR   = RESULTS_DIR / "preds"
+RESULTS_METRICS_DIR = RESULTS_DIR / "metrics"
+RESULTS_SUMMARY_DIR = RESULTS_DIR / "summary"
+EVAL_WORKERS    = 8
+EVAL_PREFETCH   = 2
 
-# ============================== Hough (full→ROI / patches) ===================
-HOUGH_ACC_INPUT_GLOB  = "full*.png"
-HOUGH_ACC_NUM_THETA   = 360
-HOUGH_FULL_DOWNSCALE  = 1
+# ============================== Hough (full + patches) =======================
+# Inputs: search both standart and augment (full context)
+HO_INPUT_GLOB   = "full*.png"
+HO_INPUT_DIRS   = [FULL_RAW_STD_DIR, FULL_RAW_AUG_DIR]
 
-# Preproc variants (best chosen by unsupervised score)
-HOUGH_AUTO_VARIANTS = [
-    {"edge": "sobel_otsu", "open": 0, "close": 0, "clahe": True},
-    {"edge": "sobel_otsu", "open": 3, "close": 0, "clahe": True},
-    {"edge": "sobel_otsu", "open": 3, "close": 3, "clahe": True},
-    {"edge": "canny",      "open": 3, "close": 0, "clahe": True},
+# Full resolution control: process context around 2048 (downscale from 10560)
+HO_DEFAULT_RES  = 2048             # 0 = native; >0 = max side target
+HO_BASE_RES     = 2048             # scaling baseline for pixel knobs
+
+# Preprocessing (baseline 2048)
+HO_PERC_LOW, HO_PERC_HIGH = 0.5, 99.9
+HO_CLAHE_CLIP, HO_CLAHE_TILE = 2.7, (16,16)
+HO_BG_MED_K      = 31
+HO_CANNY_SIGMA   = 0.33
+
+# Borders & halo
+HO_BORDER_HARD_ZERO_PX = 8
+HO_BORDER_MARGIN_PX    = 12
+HO_HALO_Q, HO_HALO_GROW, HO_ALPHA_HALO = 99.87, 21, 0.5
+
+# Very thin vertical artifact
+HO_ARTV_MAX_THICK      = 2
+HO_ARTV_MIN_AREA       = 25
+HO_ARTV_CONNECT_LEN    = 61
+HO_ARTV_BORDER_XMARGIN = 3
+HO_ARTV_FULLH_TOL      = 3
+
+# Exact 90° rejection
+HO_REJECT_EXACT_VERTICAL = True
+
+# Full profiles (baseline 2048)
+PROFILES_FULL = [
+    dict(LABEL="perm", COH_WIN=11, COH_THR_ABS=0.08, COH_THR_PERC=98.2, ORI_TOL_DEG=18.0, DIR_CLOSE_LEN=80),
+    dict(LABEL="med",  COH_WIN=9,  COH_THR_ABS=0.18, COH_THR_PERC=99.2, ORI_TOL_DEG=12.0, DIR_CLOSE_LEN=55),
+    dict(LABEL="rest", COH_WIN=9,  COH_THR_ABS=0.28, COH_THR_PERC=99.5, ORI_TOL_DEG=10.0, DIR_CLOSE_LEN=61),
+]
+# Patch profiles (dimensionless thresholds; close length scaled relative to patch)
+PROFILES_PATCH = [
+    dict(LABEL="perm", COH_WIN=11, COH_THR_ABS=0.06, COH_THR_PERC=98.0, ORI_TOL_DEG=22.0, DIR_CLOSE_LEN=60),
+    dict(LABEL="med",  COH_WIN=9,  COH_THR_ABS=0.14, COH_THR_PERC=99.0, ORI_TOL_DEG=16.0, DIR_CLOSE_LEN=45),
+    dict(LABEL="rest", COH_WIN=9,  COH_THR_ABS=0.22, COH_THR_PERC=99.4, ORI_TOL_DEG=14.0, DIR_CLOSE_LEN=45),
 ]
 
-# Canny thresholds from |grad| percentiles (more permissive)
-CANNY_PERC_LOW           = 80.0
-CANNY_PERC_HIGH          = 99.0
-CANNY_PERC_LOW_FALLBACK  = 75.0
-CANNY_PERC_HIGH_FALLBACK = 98.0
+# HoughP scans (patch)
+HOUGHP_GLOBAL_SCAN_PATCH = [
+    dict(rho=1, theta=np.pi/180, threshold=22, minLineLength=36, maxLineGap=110),
+    dict(rho=1, theta=np.pi/180, threshold=27, minLineLength=48, maxLineGap=80),
+]
+HOUGHP_LOCAL_SCAN_PATCH = [
+    dict(rho=1, theta=np.pi/180, threshold=20, minLineLength=28, maxLineGap=8),
+    dict(rho=1, theta=np.pi/180, threshold=24, minLineLength=36, maxLineGap=6),
+]
 
-# Heatmap score S = w_peak*peakiness(topK) + w_anis*anisotropy
-HOUGH_SCORE_TOPK   = 64
-HOUGH_SCORE_W_PEAK = 0.7
-HOUGH_SCORE_W_ANIS = 0.3
+# Validation (patch)
+SUPPORT_BAND_PX_PATCH      = 7
+SUPPORT_MIN_DENSITY_PATCH  = 0.012
+SUPPORT_MIN_MEAN_COH_PATCH = 0.16
+SUPPORT_MAX_ODISP_PATCH    = 18.0
+ORI_TOL_VALID_PATCH        = 20.0
+BORDER_REJECT_FRAC_PATCH   = 1.10
 
-# Peak selection (auto-percentile target)
-HPOINTS_K_MIN         = 2
-HPOINTS_K_MAX         = 20
-HPOINTS_PMIN          = 99.30
-HPOINTS_PMAX          = 99.99
-HPOINTS_BIN_STEPS     = 10
-HPOINTS_MIN_DIST_RHO  = 80      # rho-bin distance (not px), a bit looser
-HPOINTS_MIN_ANGLE_DEG = 2.0
-HPOINTS_MAX_PEAKS     = 48
-HPOINTS_DOT_RADIUS    = 2
-HPOINTS_BG_ALPHA      = 0.12
+# Connectivity
+AREA_THRESHOLD_PATCH = 400
+MIN_COMP_SIZE_PATCH  = 120
+CLOSE_K_SZ           = 3
 
-# Refinement
-HOUGH_REFINE_PEAK_WINDOW      = 7
-HOUGH_REFINE_LOCAL_DRHO_PX    = 6
-HOUGH_REFINE_LOCAL_DTHETA_DEG = 0.4
-HOUGH_REFINE_LOCAL_STEP_THETA = 0.1
+# Trim
+PROFILE_MAX_GAP_BASE = 22
+PROFILE_MIN_LEN_PATCH= 24
 
-# Artifact handling (col/row defects)
-ARTIF_KMAD        = 6.0
-ARTIF_MIN_RUN     = 8
-ANGLE_VETO_DEG    = 2.0
-ANGLE_VETO_WEIGHT = 0.2
-
-# Line validation / pruning (looser)
-HOUGH_INV_LINE_THICKNESS = 2
-HOUGH_LINE_MINLEN_FULL   = 1500
-HOUGH_ONOFF_OFFSET_PX    = 3
-HOUGH_KEEP_TOPK          = 8
-HOUGH_KEEP_SCORE_PCT     = 90.0     # keep more candidates
-
-# Continuity/width gates (looser)
-CONTINUITY_THR_PCT  = 85.0
-CONTINUITY_MIN_FRAC = 0.40
-WIDTH_REL_THR       = 0.5
-WIDTH_MIN_PX        = 0.5
-WIDTH_MAX_PX        = 12.0
-WIDTH_PROFILE_HALF  = 8
-WIDTH_SAMPLES_ALONG = 30
-
-# Emergency fallback (if still 0 lines after pruning)
-HOUGH_EMERGENCY_ENABLE = True
-HOUGH_EMERG_MINLEN     = 1200
-HOUGH_EMERG_TOPK       = 2   # pick top-N by on-off score
-
-# ROI outputs
-ROI_IMG_DIR            = LABELS_DIR / "roi"
-ROI_OUT_CSV            = LABELS_DIR / "roi_candidates.csv"
-ROI_BAND_PX            = 8
-ROI_PATCH_MIN_PIXELS   = 300
-ROI_PATCH_MIN_RATIO    = 0.005
-ROI_VIS_DIR            = RESULTS_VIS_DIR / "roi_full"
-
-# Patch Hough (input to ResNet)
-PATCH_THETA_DELTA_DEG  = 6.0
+# Accumulator (ρ,θ) per patch (points)
+HO_ACC_NUM_THETA        = 360
+HO_PEAKS_PERCENTILE     = 98.5
+HO_PEAKS_MIN_DIST       = 8
+HO_PEAKS_MIN_ANGLE_DEG  = 2.0
+HO_PEAKS_MAX            = 24
+HO_PEAKS_DOT_RADIUS     = 2
 
 # Parallelism
-HOUGH_FULL_JOBS  = 1
-HOUGH_PATCH_JOBS = 1
+HO_JOBS = max(1, (os.cpu_count() or 4) // 2)
 
 # ============================== combined =====================================
-COMBINED_ALPHA = 0.5
+COMBINED_ALPHA = 0.5  # (unused for stacking; kept for potential blends)
+COMBINED_STD_DIR = PATCHES_DIR / "combined" / "standart"
+COMBINED_AUG_DIR = PATCHES_DIR / "combined" / "augment"
+SFX_C = "cmb"
+COMBINED_JOBS = 8
