@@ -216,5 +216,3 @@ results/
 - Run order: `slice → hough → augment → combined → label → split → train → test → results`.
 - Use the bundled one‑liners above to run **all trainings**, **all tests**, per‑arch batches, or individual runs.
 
-Happy training! 🚀
-
