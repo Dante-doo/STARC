@@ -1,7 +1,5 @@
 # README – STARC
 
-> **Nota rápida**
->
 > *Por padrão, os **testes** usam `--aug rebalance` apenas para **apontar a pasta do checkpoint**. O **conjunto de teste não recebe nenhum augment**; ele sempre lê `labels/test.csv` com imagens reais. O **treino**, por padrão, usa dados balanceados via `aug rebalance`.*
 
 ---
